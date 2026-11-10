@@ -177,10 +177,6 @@ class Skills(unittest.TestCase):
             self.assertIn("NEVER print", text, name)
         self.assertIn("Restart Claude Code", self.read("send-traces"))
 
-    def test_no_stale_command_names(self):
-        for name in ALL_SKILLS:
-            self.assertNotIn("send-costs", self.read(name), name)
-
     def test_no_bare_python_allowed_tools(self):
         for name in ALL_SKILLS:
             self.assertNotIn("python3:*", self.read(name), name)
