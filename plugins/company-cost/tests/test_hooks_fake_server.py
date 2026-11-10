@@ -593,6 +593,7 @@ class TestSyncChild(HookCase):
 
 class TestCliSubprocess(HookCase):
     def test_setup_with_token_stdin_via_real_process(self):
+        os.unlink(os.path.join(self.cfg, "settings.company-cost.json"))  # fresh install: no sidecar yet
         env = self.env(configured=False)
         argv = [sys.executable, SCRIPT, "setup", "--url", "https://ingest.example.com", "--token-stdin"]
         self.assertNotIn(self.token, " ".join(argv))

@@ -12,6 +12,7 @@ Commands:
   company-cost _sync --cwd DIR     (internal detached OpenSpec sync)
 """
 import argparse
+import functools
 import getpass
 import hashlib
 import json
@@ -472,6 +473,36 @@ def setup_features(side):
     if isinstance(side.get("features"), dict) or side.get("url"):
         return feature_flags(side)
     return dict((k, False) for k in FEATURES)
+
+
+SIDECAR_LOCK_WAIT = 5.0
+
+
+def _sidecar_lock_path():
+    return os.path.join(config_dir(), "settings.company-cost.lock")
+
+
+def with_sidecar_lock(fn):
+    """Serialize sidecar read-modify-write transactions across concurrent company-cost commands.
+
+    The last positional argument of the wrapped command is its `err` stream.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        err = args[-1]
+        try:
+            os.makedirs(config_dir(), exist_ok=True)
+        except OSError:
+            pass
+        lock = FileLock(_sidecar_lock_path(), stale=QUEUE_LOCK_STALE, wait=SIDECAR_LOCK_WAIT)
+        if not lock.acquire():
+            err.write("error: another company-cost command is changing the settings; try again in a moment.\n")
+            return 1
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            lock.release()
+    return wrapper
 
 
 def save_sidecar(side):
@@ -1133,16 +1164,22 @@ def _queue_restore(claim, unsent):
         return lk.held
 
 
-def _item_allowed(flags, suffix, payload):
-    """Queued items of a disabled feature are dropped instead of sent."""
+def _prepare_item(flags, suffix, payload):
+    """Return the payload to deliver for a queued item, or None to drop it.
+
+    Items of a disabled feature are dropped; with openspec off the change fields queued earlier are stripped.
+    """
     if flags is None:
-        return True
+        return payload
     if suffix == "snapshot":
-        return flags["openspec"]
-    if flags["costs"]:
-        return True
-    # openspec-only: the only session event allowed is the registration `start`
-    return suffix == "session" and payload.get("event") == "start"
+        return payload if flags["openspec"] else None
+    if not flags["costs"]:
+        # openspec-only: the only session event allowed is the registration `start`
+        if not (suffix == "session" and payload.get("event") == "start"):
+            return None
+    if not flags["openspec"]:
+        payload = dict((k, v) for k, v in payload.items() if k not in ("change_name", "change_source"))
+    return payload
 
 
 def flush_queue(cfg, budget=QUEUE_FLUSH_BUDGET, flags=None):
@@ -1164,7 +1201,8 @@ def flush_queue(cfg, budget=QUEUE_FLUSH_BUDGET, flags=None):
                 suffix, payload = item["path"], item["payload"]
                 if suffix not in _QUEUE_SUFFIXES or not isinstance(payload, dict):
                     continue
-                if not _item_allowed(flags, suffix, payload):
+                payload = _prepare_item(flags, suffix, payload)
+                if payload is None:
                     continue
             except Exception:
                 continue
@@ -1516,19 +1554,32 @@ def enable_costs(side, force, err):
             err.write("error: settings.json already defines different values for:\n")
             for k in conflicts:
                 err.write("  - %s\n" % k)
-            err.write("Nothing was changed. Re-run with --force to override (old values are saved and restored on "
-                      "send-traces off / uninstall).\n")
+            err.write("Nothing was changed. List these keys to the user and, only after an explicit yes, run "
+                      "`company-cost send-traces on --force` (/company-cost:send-traces); old values are saved and "
+                      "restored on send-traces off / uninstall.\n")
             return 1
         previous = dict((k, env[k]) for k in wanted if k in env)
-    _make_backup(path) if existed else None
+    if existed:
+        _make_backup(path)
     side.update({"managed_keys": sorted(wanted), "previous": previous, "env_was_missing": env_was_missing})
-    save_sidecar(side)
+    # Two-phase: (1) record managed_keys/previous with the feature flag at its persisted value,
+    # (2) write settings.json, (3) flip features.costs last. A failure in (2) leaves flag and file consistent.
+    staged = dict(side)
+    staged["features"] = dict(side.get("features") or {})
+    staged["features"]["costs"] = feature_flags(read_sidecar())["costs"]
     env.update(wanted)
     settings["env"] = env
-    _write_settings(path, settings, existed)
+    try:
+        save_sidecar(staged)
+        _write_settings(path, settings, existed)
+    except OSError as e:
+        err.write("error: could not write %s: %s. The traces flag was not changed.\n" % (path, e.strerror or e))
+        return 1
+    save_sidecar(side)
     return 0
 
 
+@with_sidecar_lock
 def do_setup(url, token, force, allow_insecure, out, err):
     os.makedirs(config_dir(), exist_ok=True)
     side = read_sidecar()
@@ -1574,6 +1625,7 @@ def _describe(feature, flags, out):
         out.write("  %s\n" % REGISTRATION_NOTE)
 
 
+@with_sidecar_lock
 def do_send_traces(action, force, out, err):
     side = read_sidecar()
     flags = feature_flags(side)
@@ -1600,22 +1652,29 @@ def do_send_traces(action, force, out, err):
         out.write("Wrote %d keys to the env block of %s\n" % (len(MANAGED_ENV_KEYS), settings_path()))
         out.write("Restart Claude Code for the telemetry settings to take effect.\n")
         return 0
-    # off
+    # off: persist the flag FIRST so a settings.json problem can never leave traces on
     if not side and not load_config():
         out.write("traces: disabled (nothing configured)\n")
         return 0
+    flags["costs"] = False
+    persisted = dict(side)
+    persisted["features"] = flags
+    save_sidecar(persisted)
     path = settings_path()
     settings, existed, problem = load_settings(path)
+    if not problem and "env" in settings and not isinstance(settings["env"], dict):
+        problem = "'env' in %s is not an object; refusing to touch it" % path
     if problem:
         err.write("error: %s\n" % problem)
+        err.write("traces: disabled (nothing is sent), but the OTEL keys remain in %s and telemetry keeps "
+                  "being exported. Fix that file, then run `company-cost send-traces off` again to remove them.\n"
+                  % path)
         return 1
     if remove_managed_env(settings, side):
         _write_settings(path, settings, existed)
-    new = dict(side)
+    new = dict(persisted)
     for k in ("managed_keys", "previous", "env_was_missing"):
         new.pop(k, None)
-    flags["costs"] = False
-    new["features"] = flags
     save_sidecar(new)
     out.write("traces: disabled\n  Removed the managed keys from %s (previous values restored); "
               "URL and token are kept.\n" % path)
@@ -1623,6 +1682,7 @@ def do_send_traces(action, force, out, err):
     return 0
 
 
+@with_sidecar_lock
 def do_send_openspec(action, out, err):
     side = read_sidecar()
     flags = feature_flags(side)
@@ -1724,12 +1784,14 @@ def remove_managed_env(settings, side):
                 if k not in env:
                     env[k] = v
                     changed = True
-            if not env:
+            # delete `env` only if setup created it (env_was_missing); an original `{}` stays
+            if not env and not (side and side.get("env_was_missing") is False):
                 del settings["env"]
                 changed = True
     return changed
 
 
+@with_sidecar_lock
 def do_uninstall(out, err):
     path = settings_path()
     settings, existed, problem = load_settings(path)
