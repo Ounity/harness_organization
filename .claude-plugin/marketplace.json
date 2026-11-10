@@ -1,0 +1,23 @@
+{
+  "name": "ounity-plugins",
+  "description": "Public Claude Code plugins maintained by Ounity.",
+  "owner": {
+    "name": "Ounity"
+  },
+  "plugins": [
+    {
+      "name": "company-cost",
+      "source": "./plugins/company-cost",
+      "description": "Reports Claude Code cost telemetry and OpenSpec progress to an ingest service you configure.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Ounity"
+      },
+      "homepage": "https://github.com/Ounity/harness_organization",
+      "repository": "https://github.com/Ounity/harness_organization",
+      "license": "Apache-2.0",
+      "keywords": ["cost", "telemetry", "openspec", "otel"],
+      "category": "monitoring"
+    }
+  ]
+}
