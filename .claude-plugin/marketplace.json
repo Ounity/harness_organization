@@ -9,7 +9,7 @@
       "name": "company-cost",
       "source": "./plugins/company-cost",
       "description": "Reports Claude Code cost telemetry and OpenSpec progress to an ingest service you configure.",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "author": {
         "name": "Ounity"
       },
