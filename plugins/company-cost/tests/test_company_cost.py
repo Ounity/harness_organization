@@ -83,11 +83,22 @@ class EnvCase(unittest.TestCase):
                 rc = e.code
         return rc, out.getvalue(), err.getvalue()
 
-    def setup_ok(self, url="https://ingest.example.com", token=None, extra=()):
+    def setup_only(self, url="https://ingest.example.com", token=None, extra=()):
         token = token or fake_token()
         rc, out, err = self.run_cli(["setup", "--url", url, "--token-stdin"] + list(extra), stdin=token + "\n")
         self.assertEqual(rc, 0, err)
         return token
+
+    def setup_ok(self, url="https://ingest.example.com", token=None, extra=()):
+        """Connection + `send-costs on`: the 0.1.0 outcome (managed keys in settings.json)."""
+        token = self.setup_only(url, token)
+        rc, out, err = self.run_cli(["send-costs", "on"] + list(extra))
+        self.assertEqual(rc, 0, err)
+        return token
+
+    def read_side(self):
+        with open(self.sidecar) as f:
+            return json.load(f)
 
     def all_data_text(self):
         chunks = []
@@ -741,10 +752,13 @@ class TestSetupUninstall(EnvCase):
     def test_R03_invalid_json_untouched(self):
         for bad in ("{not json", "[1,2]", "42"):
             self.write_settings(bad)
-            rc, out, err = self.run_cli(["setup", "--url", self.URL, "--token-stdin"], stdin="tok\n")
+            self.setup_only(token="tok")
+            self.assertEqual(self.read_side()["features"]["costs"], False)
+            rc, out, err = self.run_cli(["send-costs", "on"])
             self.assertEqual(rc, 1)
             self.assertEqual(slurp(self.settings), bad)
-            self.assertFalse(os.path.exists(self.sidecar))
+            self.assertEqual(self.read_side()["features"]["costs"], False)
+            self.assertNotIn("managed_keys", self.read_side())
             self.assertFalse(os.path.exists(self.bak))
             rc, _, _ = self.run_cli(["uninstall"])
             self.assertEqual(rc, 1)
@@ -752,18 +766,20 @@ class TestSetupUninstall(EnvCase):
 
     def test_R03_env_not_dict_refused(self):
         self.write_settings({"env": "oops"})
-        rc, _, err = self.run_cli(["setup", "--url", self.URL, "--token-stdin"], stdin="tok\n")
+        self.setup_only(token="tok")
+        rc, _, err = self.run_cli(["send-costs", "on"])
         self.assertEqual(rc, 1)
         self.assertEqual(self.read_settings(), {"env": "oops"})
 
     def test_R03_conflict_without_force_changes_nothing(self):
         original = {"env": {"OTEL_LOGS_EXPORTER": "console", "KEEP": "1"}}
         self.write_settings(original)
-        rc, out, err = self.run_cli(["setup", "--url", self.URL, "--token-stdin"], stdin="tok\n")
+        self.setup_only(token="tok")
+        rc, out, err = self.run_cli(["send-costs", "on"])
         self.assertEqual(rc, 1)
         self.assertIn("OTEL_LOGS_EXPORTER", err)
         self.assertEqual(self.read_settings(), original)
-        self.assertFalse(os.path.exists(self.sidecar))
+        self.assertNotIn("managed_keys", self.read_side())
         self.assertFalse(os.path.exists(self.bak))
 
     def test_R03_force_then_uninstall_restores_previous(self):
@@ -855,6 +871,7 @@ class TestSetupUninstall(EnvCase):
         other = os.path.join(self.tmp, "other-cfg")
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": other}):
             self.assertEqual(self.run_cli(["setup", "--url", self.URL, "--token-stdin"], stdin="t\n")[0], 0)
+            self.assertEqual(self.run_cli(["send-costs", "on"])[0], 0)
         self.assertTrue(os.path.exists(os.path.join(other, "settings.json")))
         self.assertFalse(os.path.exists(self.settings))
 

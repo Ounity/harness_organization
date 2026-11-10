@@ -3,6 +3,8 @@
 
 Commands:
   company-cost setup [--url U] [--token T] [--token-stdin] [--force] [--allow-insecure]
+  company-cost send-costs [on|off|status] [--force]      (default: on)
+  company-cost send-openspec [on|off|status]             (default: on)
   company-cost uninstall
   company-cost status
   company-cost doctor
@@ -435,6 +437,38 @@ def load_config():
     if err or validate_token(token):
         return None
     return {"url": clean, "token": token}
+
+
+FEATURES = ("costs", "openspec")
+FEATURE_SENDS = {
+    "costs": "OTEL telemetry keys in settings.json; session start/heartbeat/end events "
+             "(project, branch, cwd hash); redacted prompt excerpt (max 200 chars)",
+    "openspec": "change name/source on session events; OpenSpec file mirror (sync/plan, sync/files); "
+                "change snapshot",
+}
+REGISTRATION_NOTE = ("openspec-only registration exception: the server rejects sync for an unknown project "
+                     "(409), so ONE session 'start' event (project, branch, cwd hash, change) is sent per "
+                     "session; no heartbeat, end or prompt excerpt is sent")
+
+
+def feature_flags(side):
+    """Return {'costs': bool, 'openspec': bool}. A sidecar without `features` (0.1.0) means both on."""
+    f = side.get("features") if isinstance(side, dict) else None
+    if isinstance(f, dict):
+        return dict((k, f.get(k) is True) for k in FEATURES)
+    return dict((k, True) for k in FEATURES)
+
+
+def setup_features(side):
+    """Flags `setup` keeps: existing ones, legacy installs stay on, a fresh install starts with both off."""
+    if isinstance(side.get("features"), dict) or side.get("url"):
+        return feature_flags(side)
+    return dict((k, False) for k in FEATURES)
+
+
+def save_sidecar(side):
+    side["version"] = VERSION
+    atomic_write(sidecar_path(), json.dumps(side, indent=2, sort_keys=True) + "\n", 0o600)
 
 
 # ---------------------------------------------------------------------------
@@ -1409,9 +1443,8 @@ def clear_auth_state():
     mutate_state(f)
 
 
-def do_setup(url, token, force, allow_insecure, out, err):
-    cfgdir = config_dir()
-    os.makedirs(cfgdir, exist_ok=True)
+def enable_costs(side, force, err):
+    """Write the managed OTEL keys into settings.json and save `side` (features must already say costs on)."""
     path = settings_path()
     settings, existed, problem = load_settings(path)
     if problem:
@@ -1422,8 +1455,7 @@ def do_setup(url, token, force, allow_insecure, out, err):
         return 1
     env_was_missing = "env" not in settings
     env = settings.get("env", {})
-    wanted = build_env(url, token)
-    side = read_sidecar()
+    wanted = build_env(side["url"], side["token"])
     managed = env.get(SENTINEL_KEY) == "1"
     if managed:
         previous = side.get("previous") if isinstance(side.get("previous"), dict) else {}
@@ -1435,28 +1467,131 @@ def do_setup(url, token, force, allow_insecure, out, err):
             err.write("error: settings.json already defines different values for:\n")
             for k in conflicts:
                 err.write("  - %s\n" % k)
-            err.write("Nothing was changed. Re-run with --force to override (old values are saved and restored on uninstall).\n")
+            err.write("Nothing was changed. Re-run with --force to override (old values are saved and restored on "
+                      "send-costs off / uninstall).\n")
             return 1
         previous = dict((k, env[k]) for k in wanted if k in env)
     _make_backup(path) if existed else None
-    side_doc = {
-        "managed_keys": sorted(wanted),
-        "previous": previous,
-        "env_was_missing": env_was_missing,
-        "url": url,
-        "token": token,
-        "version": VERSION,
-        "allow_insecure": bool(allow_insecure),
-    }
-    atomic_write(sidecar_path(), json.dumps(side_doc, indent=2, sort_keys=True) + "\n", 0o600)
+    side.update({"managed_keys": sorted(wanted), "previous": previous, "env_was_missing": env_was_missing})
+    save_sidecar(side)
     env.update(wanted)
     settings["env"] = env
     _write_settings(path, settings, existed)
+    return 0
+
+
+def do_setup(url, token, force, allow_insecure, out, err):
+    os.makedirs(config_dir(), exist_ok=True)
+    side = read_sidecar()
+    feats = setup_features(side)
+    new = dict((k, side[k]) for k in ("managed_keys", "previous", "env_was_missing") if k in side)
+    new.update({"url": url, "token": token, "allow_insecure": bool(allow_insecure), "features": feats})
+    if feats["costs"]:
+        # costs already on: keep settings.json in sync with the (possibly new) URL/token
+        rc = enable_costs(new, force, err)
+        if rc:
+            return rc
+    else:
+        save_sidecar(new)
     clear_auth_state()
-    out.write("company-cost configured.\n")
+    out.write("company-cost connection saved.\n")
     out.write("  URL:   %s\n  token: set (hidden)\n" % url)
-    out.write("  Wrote %d keys to the env block of %s\n" % (len(wanted), path))
-    out.write("Restart Claude Code for telemetry settings to take effect.\n")
+    if feats["costs"]:
+        out.write("  Refreshed the managed keys in %s (costs is on). Restart Claude Code.\n" % settings_path())
+    if not any(feats.values()):
+        out.write("Nothing is sent yet and settings.json was not touched. Next steps:\n")
+    else:
+        out.write("Features: costs %s, openspec %s. Next steps (optional):\n"
+                  % tuple("on" if feats[k] else "off" for k in FEATURES))
+    out.write("  /company-cost:send-costs      cost telemetry + sessions + prompt excerpt\n")
+    out.write("  /company-cost:send-openspec   OpenSpec change tracking and file mirror\n")
+    return 0
+
+
+def _flip_feature(feature, value):
+    side = dict(read_sidecar())
+    flags = feature_flags(side)
+    flags[feature] = value
+    side["features"] = flags
+    save_sidecar(side)
+    return flags
+
+
+def _describe(feature, flags, out):
+    on = flags[feature]
+    out.write("%s: %s\n" % (feature, "enabled" if on else "disabled"))
+    out.write("  sends: %s\n" % FEATURE_SENDS[feature])
+    if flags["openspec"] and not flags["costs"] and feature == "openspec" and on:
+        out.write("  %s\n" % REGISTRATION_NOTE)
+
+
+def do_send_costs(action, force, out, err):
+    side = read_sidecar()
+    flags = feature_flags(side)
+    if action == "status":
+        _describe("costs", flags, out)
+        return 0
+    if action == "on":
+        if _is_windows():
+            err.write("error: company-cost send-costs supports macOS/Linux/WSL only.\n")
+            return 1
+        cfg = load_config()
+        if not cfg:
+            err.write("error: no ingest URL/token configured. Run /company-cost:setup first.\n")
+            return 1
+        new = dict(side)
+        flags["costs"] = True
+        new.update({"url": cfg["url"], "token": cfg["token"], "features": flags,
+                    "allow_insecure": bool(side.get("allow_insecure"))})
+        rc = enable_costs(new, force, err)
+        if rc:
+            return rc
+        clear_auth_state()
+        out.write("costs: enabled\n  sends: %s\n" % FEATURE_SENDS["costs"])
+        out.write("Wrote %d keys to the env block of %s\n" % (len(MANAGED_ENV_KEYS), settings_path()))
+        out.write("Restart Claude Code for the telemetry settings to take effect.\n")
+        return 0
+    # off
+    if not side and not load_config():
+        out.write("costs: disabled (nothing configured)\n")
+        return 0
+    path = settings_path()
+    settings, existed, problem = load_settings(path)
+    if problem:
+        err.write("error: %s\n" % problem)
+        return 1
+    if remove_managed_env(settings, side):
+        _write_settings(path, settings, existed)
+    new = dict(side)
+    for k in ("managed_keys", "previous", "env_was_missing"):
+        new.pop(k, None)
+    flags["costs"] = False
+    new["features"] = flags
+    save_sidecar(new)
+    out.write("costs: disabled\n  Removed the managed keys from %s (previous values restored); "
+              "URL and token are kept.\n" % path)
+    out.write("Restart Claude Code so the telemetry settings stop being read.\n")
+    return 0
+
+
+def do_send_openspec(action, out, err):
+    side = read_sidecar()
+    flags = feature_flags(side)
+    if action == "status":
+        _describe("openspec", flags, out)
+        return 0
+    if action == "on":
+        if not load_config():
+            err.write("error: no ingest URL/token configured. Run /company-cost:setup first.\n")
+            return 1
+        flags = _flip_feature("openspec", True)
+        _describe("openspec", flags, out)
+        return 0
+    if not side and not load_config():
+        out.write("openspec: disabled (nothing configured)\n")
+        return 0
+    flags = _flip_feature("openspec", False)
+    _describe("openspec", flags, out)
     return 0
 
 
@@ -1513,13 +1648,8 @@ def _remove_data_dirs():
             shutil.rmtree(real, ignore_errors=True)
 
 
-def do_uninstall(out, err):
-    path = settings_path()
-    settings, existed, problem = load_settings(path)
-    if problem:
-        err.write("error: %s\n" % problem)
-        return 1
-    side = read_sidecar()
+def remove_managed_env(settings, side):
+    """Remove exactly the managed env keys (restoring previous values). Returns True if settings changed."""
     env = settings.get("env")
     changed = False
     if isinstance(env, dict):
@@ -1548,7 +1678,17 @@ def do_uninstall(out, err):
             if not env:
                 del settings["env"]
                 changed = True
-    if changed:
+    return changed
+
+
+def do_uninstall(out, err):
+    path = settings_path()
+    settings, existed, problem = load_settings(path)
+    if problem:
+        err.write("error: %s\n" % problem)
+        return 1
+    side = read_sidecar()
+    if remove_managed_env(settings, side):
         _write_settings(path, settings, existed)
     for p in (sidecar_path(), backup_path()):
         try:
@@ -1589,18 +1729,26 @@ def do_status(out):
     out.write("URL: %s\n" % cfg["url"])
     out.write("Token: set (hidden)\n")
     side = read_sidecar()
-    settings, _, _ = load_settings(settings_path())
-    env = (settings or {}).get("env")
-    env = env if isinstance(env, dict) else {}
-    keys = side.get("managed_keys") if isinstance(side.get("managed_keys"), list) else list(MANAGED_ENV_KEYS)
-    missing = [k for k in keys if k not in env]
-    if env.get(SENTINEL_KEY) == "1" and not missing:
-        out.write("Managed keys: present (%d)\n" % len(keys))
-    else:
-        out.write("Managed keys: MISSING%s (run /company-cost:setup)\n" % (" " + ",".join(missing) if missing else ""))
-    ep = env.get("OTEL_EXPORTER_OTLP_ENDPOINT")
-    if ep and ep != cfg["url"] + "/v1/otlp":
-        out.write("WARNING: OTLP endpoint in settings.json differs from the configured URL\n")
+    flags = feature_flags(side)
+    out.write("Features:\n")
+    for name in FEATURES:
+        _describe(name, flags, out)
+    if not any(flags.values()):
+        out.write("Nothing is being sent. Enable with /company-cost:send-costs and/or /company-cost:send-openspec\n")
+    if flags["costs"]:
+        settings, _, _ = load_settings(settings_path())
+        env = (settings or {}).get("env")
+        env = env if isinstance(env, dict) else {}
+        keys = side.get("managed_keys") if isinstance(side.get("managed_keys"), list) else list(MANAGED_ENV_KEYS)
+        missing = [k for k in keys if k not in env]
+        if env.get(SENTINEL_KEY) == "1" and not missing:
+            out.write("Managed keys: present (%d)\n" % len(keys))
+        else:
+            out.write("Managed keys: MISSING%s (run /company-cost:send-costs)\n"
+                      % (" " + ",".join(missing) if missing else ""))
+        ep = env.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+        if ep and ep != cfg["url"] + "/v1/otlp":
+            out.write("WARNING: OTLP endpoint in settings.json differs from the configured URL\n")
     st = load_state()
     if st.get("last_ok"):
         out.write("Last ok: %s\n" % _fmt_ts(st["last_ok"]))
@@ -1634,6 +1782,9 @@ def do_doctor(out):
     except OSError:
         out.write("data dir writable: False\n")
     out.write("configured: %s\n" % ("yes" if load_config() else "no"))
+    flags = feature_flags(read_sidecar())
+    for name in FEATURES:
+        out.write("%s: %s\n" % (name, "enabled" if flags[name] else "disabled"))
     return 0
 
 
@@ -1691,10 +1842,19 @@ def main(argv=None):
         sys.stdout.write(__doc__)
         return 0 if argv else 1
     cmd, rest = argv[0], argv[1:]
-    if cmd in ("setup", "status", "doctor"):
+    if cmd in ("setup", "status", "doctor", "send-costs", "send-openspec"):
         use_discovered_data_dir()
     if cmd == "setup":
         return cmd_setup(rest)
+    if cmd in ("send-costs", "send-openspec"):
+        ap = argparse.ArgumentParser(prog="company-cost " + cmd)
+        ap.add_argument("action", nargs="?", default="on", choices=("on", "off", "status"))
+        if cmd == "send-costs":
+            ap.add_argument("--force", action="store_true")
+        args = ap.parse_args(rest)
+        if cmd == "send-costs":
+            return do_send_costs(args.action, args.force, sys.stdout, sys.stderr)
+        return do_send_openspec(args.action, sys.stdout, sys.stderr)
     if cmd == "uninstall":
         return do_uninstall(sys.stdout, sys.stderr)
     if cmd == "status":
