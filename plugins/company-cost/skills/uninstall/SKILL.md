@@ -19,7 +19,7 @@ If `company-cost` is not found on PATH, use:
 python3 "${CLAUDE_PLUGIN_ROOT}/bin/company-cost" uninstall
 ```
 
-It restores any previous values in the `env` block of `settings.json`, removes the plugin's keys, the sidecar file, the backup and the local data directory.
+It restores any previous values in the `env` block of `settings.json`, removes the plugin's keys, the sidecar file (including the feature switches), the backup and the local data directory. It works the same whether the features are on or off.
 
 Then list the remaining steps to the user, in this order:
 

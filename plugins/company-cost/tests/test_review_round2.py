@@ -293,7 +293,7 @@ class TestF9Skills(unittest.TestCase):
             return re.search(r"^allowed-tools:\s*(.*)$", f.read(), re.M).group(1)
 
     def test_no_bare_python_wildcard(self):
-        for n in ("setup", "status", "uninstall"):
+        for n in ("setup", "status", "uninstall", "send-traces", "send-openspec"):
             self.assertNotIn("python3:*", self.fm(n), n)
             self.assertNotRegex(self.fm(n), r"Bash\(python3 :?\*\)")
 
@@ -301,6 +301,8 @@ class TestF9Skills(unittest.TestCase):
         self.assertIn("Bash(company-cost status)", self.fm("status"))
         self.assertIn('Bash(python3 "${CLAUDE_PLUGIN_ROOT}/bin/company-cost" status)', self.fm("status"))
         self.assertIn("Bash(company-cost uninstall)", self.fm("uninstall"))
+        for n in ("send-traces", "send-openspec"):
+            self.assertIn("Bash(company-cost %s:*)" % n, self.fm(n))
         s = self.fm("setup")
         self.assertIn("Bash(printf:*)", s)
         self.assertIn("Bash(company-cost setup:*)", s)

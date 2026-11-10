@@ -12,6 +12,7 @@ SCRIPT = os.path.join(PLUGIN, "bin", "company-cost")
 SKIP_DIRS = {".git", ".atl", "__pycache__", "tests"}
 SKIP_FILES = {"CONTRIBUTING.md", "ci.yml", ".DS_Store", "icon.png"}
 FORBIDDEN = ("acme", "192.168", "gitea", "pedro", "garcia", "unlicensed", "co-authored-by")
+ALL_SKILLS = ("setup", "status", "uninstall", "send-traces", "send-openspec")
 ALLOWED_USERCONFIG_KEYS = {"type", "title", "description", "required", "default", "sensitive",
                            "multiple", "min", "max"}
 
@@ -153,16 +154,35 @@ class Skills(unittest.TestCase):
             return f.read()
 
     def test_frontmatter(self):
-        for name in ("setup", "status", "uninstall"):
+        for name in ALL_SKILLS:
             fm = frontmatter(self.read(name))
             self.assertIsNotNone(fm, name)
             self.assertEqual(fm["name"], name)
             self.assertTrue(fm["description"])
-        for name in ("setup", "uninstall"):
+        for name in ("setup", "uninstall", "send-traces", "send-openspec"):
             self.assertEqual(frontmatter(self.read(name))["disable-model-invocation"], "true")
 
+    def test_skill_dirs_match(self):
+        dirs = sorted(d for d in os.listdir(os.path.join(PLUGIN, "skills"))
+                      if os.path.isdir(os.path.join(PLUGIN, "skills", d)))
+        self.assertEqual(dirs, sorted(ALL_SKILLS))
+
+    def test_feature_skills_arguments_and_restart(self):
+        for name in ("send-traces", "send-openspec"):
+            text = self.read(name)
+            self.assertIn("$ARGUMENTS", text, name)
+            self.assertIn("on|off", text, name)
+            self.assertIn("Bash(company-cost %s:*)" % name, text)
+            self.assertIn('Bash(python3 "${CLAUDE_PLUGIN_ROOT}/bin/company-cost" %s:*)' % name, text)
+            self.assertIn("NEVER print", text, name)
+        self.assertIn("Restart Claude Code", self.read("send-traces"))
+
+    def test_no_stale_command_names(self):
+        for name in ALL_SKILLS:
+            self.assertNotIn("send-costs", self.read(name), name)
+
     def test_no_bare_python_allowed_tools(self):
-        for name in ("setup", "status", "uninstall"):
+        for name in ALL_SKILLS:
             self.assertNotIn("python3:*", self.read(name), name)
 
     def test_setup_uses_stdin_token(self):
