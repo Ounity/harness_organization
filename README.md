@@ -2,7 +2,7 @@
 
 A Claude Code plugin that reports **cost telemetry** and **OpenSpec progress** from your sessions to an *ingest service* that you (or your organization) operate. Nothing is sent until you switch on one of two independent features: **traces** and **openspec** (see [Choose what is sent](#choose-what-is-sent)).
 
-- Status: `0.2.0`, license Apache-2.0
+- Status: `0.3.0`, license Apache-2.0
 - Platforms: **macOS, Linux, WSL**. Native Windows is **not supported** in this release.
 
 ## What it collects
@@ -50,7 +50,7 @@ claude plugin install company-cost@ounity-plugins
 
 ## Setup
 
-In Claude Code run `/company-cost:setup`. It asks for the service URL (for example `https://ingest.example.com`) and your token (`hro_REDACTED`) and stores them in `settings.company-cost.json` (mode 600). **Setup does not enable anything**: it does not touch `settings.json` and nothing is sent. It prints the next steps: `/company-cost:send-traces` and `/company-cost:send-openspec`.
+In Claude Code run `/company-cost:setup`. It asks for the service URL (for example `https://ingest.example.com`) and your token (`hro_REDACTED`) and stores them in `settings.company-cost.json` (mode 600). **Setup does not enable anything**: it does not touch `settings.json` and nothing is sent. It prints the next steps: `/company-cost:send-traces` and `/company-cost:send-openspec`. It also asks, optionally, for the [agent name](#agent-name) being monitored.
 
 Equivalent from a terminal (the token goes through stdin, never argv):
 
@@ -58,7 +58,21 @@ Equivalent from a terminal (the token goes through stdin, never argv):
 printf '%s\n' "$TOKEN" | company-cost setup --url https://ingest.example.com --token-stdin
 ```
 
+Add `--agent 'NAME'` (or `--agent=NAME`) to set the optional agent name; see [Agent name](#agent-name).
+
 Plain `http://` to a non-local host is refused unless `--allow-insecure` is passed. Re-running `setup` with a new token keeps your feature switches; if traces is on it also refreshes the token in `settings.json`.
+
+## Agent name
+
+An optional label that says which agent this installation monitors, so the service can attribute usage to it.
+
+- **What it is**: a label, not a filter. All sessions are still monitored; the name only travels with them.
+- **Set it**: `/company-cost:setup`, or `company-cost setup --agent 'Code Reviewer'`. Re-running `setup` with `--agent` replaces it, `--agent ""` clears it, and omitting `--agent` keeps the stored value. The plugin option `AGENT_NAME` (env `CLAUDE_PLUGIN_OPTION_AGENT_NAME`) is used only when the sidecar has no name; the sidecar wins.
+- **Rules**: 1 to 64 characters after trimming; letters, digits, space and `. _ - : /`. Control characters and anything that the prompt redaction would alter (secret-looking text) are rejected, and setup exits 1 without changing anything.
+- **Where it is sent**: in the `user_ref` field of every `session` event (`start`, `heartbeat`, `end`, and the lone `start` of openspec-only mode) as `agent:<name>`, only when a name is set; otherwise `user_ref` is omitted as before. Prompt, snapshot and sync payloads do not carry it. Queued session events keep the value they were built with.
+- **Visibility**: it is plain text visible to whoever operates the service. It is not a secret; do not put one in it.
+- **Caution**: this reuses the service's optional `user_ref` field. The field's purpose on the server is not documented in this repo. If your service uses `user_ref` for end-user identity, tell its operator before you set an agent name.
+- `/company-cost:status` and `company-cost doctor` show `Agent name: <name>` or `not set`. `uninstall` removes it with the sidecar.
 
 ## Choose what is sent
 
@@ -171,7 +185,7 @@ Authentication: `Authorization: Bearer hro_...` on every request. All plugin req
 | Endpoint | Purpose |
 |----------|---------|
 | `/v1/otlp` (+ `/v1/logs` appended by the exporter) | OTLP http/json log events (cost) |
-| `/v1/ingest/plugin/session` | session start / heartbeat / end |
+| `/v1/ingest/plugin/session` | session start / heartbeat / end (optional `user_ref`: `agent:<name>` when an agent name is set) |
 | `/v1/ingest/plugin/prompt` | redacted prompt excerpt |
 | `/v1/ingest/plugin/snapshot` | OpenSpec change snapshot |
 | `/v1/ingest/plugin/sync/plan` | receives file manifest, returns `{"upload": [paths], "delete": [paths]}` |
