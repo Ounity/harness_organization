@@ -1,4 +1,4 @@
-"""Feature switches (costs / openspec): sidecar flags, send-costs, send-openspec, setup, status."""
+"""Feature switches (traces / openspec): sidecar flags, send-traces, send-openspec, setup, status."""
 import json
 import os
 import stat
@@ -18,7 +18,7 @@ class FeatureCase(EnvCase):
             json.dump(obj, f)
 
     def costs(self, *args):
-        return self.run_cli(["send-costs"] + list(args))
+        return self.run_cli(["send-traces"] + list(args))
 
     def openspec(self, *args):
         return self.run_cli(["send-openspec"] + list(args))
@@ -37,11 +37,11 @@ class TestFeatureFlags(FeatureCase):
         self.write_side({"url": URL, "token": "t", "version": "0.1.0", "managed_keys": sorted(cc.MANAGED_ENV_KEYS)})
         self.assertEqual(cc.feature_flags(cc.read_sidecar()), {"costs": True, "openspec": True})
         rc, out, _ = self.run_cli(["status"])
-        self.assertIn("costs: enabled", out)
+        self.assertIn("traces: enabled", out)
         self.assertIn("openspec: enabled", out)
 
     def test_setup_leaves_features_off(self):
-        tok = self.setup_ok()
+        tok = self.setup_only()
         sc = self.side()
         self.assertEqual(sc["features"], {"costs": False, "openspec": False})
         self.assertEqual(sc["version"], cc.VERSION)
@@ -55,10 +55,10 @@ class TestFeatureFlags(FeatureCase):
         self.assertEqual(rc, 0, err)
         self.assertEqual(self.read_settings(), original)  # no conflict, no write
         self.assertFalse(os.path.exists(self.bak))
-        self.assertIn("/company-cost:send-costs", out)
+        self.assertIn("/company-cost:send-traces", out)
         self.assertIn("/company-cost:send-openspec", out)
         os.unlink(self.settings)
-        self.setup_ok()
+        self.setup_only()
         self.assertFalse(os.path.exists(self.settings))
 
     def test_setup_output_never_has_token(self):
@@ -67,32 +67,32 @@ class TestFeatureFlags(FeatureCase):
         self.assertNotIn(tok, out + err)
 
     def test_setup_rerun_keeps_flags_and_refreshes_env_when_costs_on(self):
-        self.setup_ok(token="tok-one")
+        self.setup_only(token="tok-one")
         self.assertEqual(self.costs("on")[0], 0)
         self.assertEqual(self.openspec("on")[0], 0)
-        self.setup_ok(token="tok-two")
+        self.setup_only(token="tok-two")
         self.assertEqual(self.side()["features"], {"costs": True, "openspec": True})
         self.assertIn("tok-two", self.read_settings()["env"]["OTEL_EXPORTER_OTLP_HEADERS"])
 
     def test_setup_rerun_with_costs_off_keeps_settings_clean(self):
-        self.setup_ok()
+        self.setup_only()
         self.openspec("on")
-        self.setup_ok(token="tok-two")
+        self.setup_only(token="tok-two")
         self.assertEqual(self.side()["features"], {"costs": False, "openspec": True})
         self.assertFalse(os.path.exists(self.settings))
 
     def test_setup_over_legacy_sidecar_keeps_both_on(self):
         self.write_settings({})
-        self.setup_ok()
+        self.setup_only()
         self.costs("on")
         sc = self.side()
         del sc["features"]
         self.write_side(sc)  # looks like a 0.1.0 install
-        self.setup_ok(token="tok-two")
+        self.setup_only(token="tok-two")
         self.assertEqual(self.side()["features"], {"costs": True, "openspec": True})
 
 
-class TestSendCosts(FeatureCase):
+class TestSendTraces(FeatureCase):
     def test_on_requires_configuration(self):
         for argv in ([], ["on"]):
             rc, out, err = self.costs(*argv)
@@ -102,7 +102,7 @@ class TestSendCosts(FeatureCase):
         self.assertFalse(os.path.exists(self.sidecar))
 
     def test_default_action_is_on(self):
-        self.setup_ok()
+        self.setup_only()
         rc, out, err = self.costs()
         self.assertEqual(rc, 0, err)
         self.assertEqual(sorted(self.read_settings()["env"]), sorted(cc.MANAGED_ENV_KEYS))
@@ -110,7 +110,7 @@ class TestSendCosts(FeatureCase):
         self.assertIn("Restart Claude Code", out)
 
     def test_on_writes_exactly_the_old_setup_result(self):
-        tok = self.setup_ok(URL + "/")
+        tok = self.setup_only(URL + "/")
         self.costs("on")
         env = self.read_settings()["env"]
         self.assertEqual(len(env), 9)
@@ -125,7 +125,7 @@ class TestSendCosts(FeatureCase):
 
     def test_on_backup_first_kept_and_idempotent(self):
         self.write_settings({"model": "first"})
-        self.setup_ok()
+        self.setup_only()
         self.costs("on")
         first = slurp(self.bak)
         self.assertEqual(json.loads(first), {"model": "first"})
@@ -142,7 +142,7 @@ class TestSendCosts(FeatureCase):
                     os.unlink(p)
             self.write_settings(original)
             before = slurp(self.settings)
-            self.setup_ok()
+            self.setup_only()
             self.costs("on")
             self.assertNotEqual(self.read_settings(), original)
             rc, out, err = self.costs("off")
@@ -151,7 +151,7 @@ class TestSendCosts(FeatureCase):
             self.assertEqual(json.loads(before), original)
 
     def test_off_removes_env_and_keeps_url_token(self):
-        tok = self.setup_ok()
+        tok = self.setup_only()
         self.write_settings({"model": "m"})
         self.costs("on")
         self.costs("off")
@@ -166,7 +166,7 @@ class TestSendCosts(FeatureCase):
     def test_foreign_keys_conflict_without_force_changes_nothing(self):
         original = {"env": {"OTEL_LOGS_EXPORTER": "console", "KEEP": "1"}}
         self.write_settings(original)
-        self.setup_ok()
+        self.setup_only()
         rc, out, err = self.costs("on")
         self.assertEqual(rc, 1)
         self.assertIn("OTEL_LOGS_EXPORTER", err)
@@ -177,7 +177,7 @@ class TestSendCosts(FeatureCase):
     def test_force_then_off_restores_previous(self):
         original = {"env": {"OTEL_LOGS_EXPORTER": "console", "KEEP": "1"}, "model": "m"}
         self.write_settings(original)
-        self.setup_ok()
+        self.setup_only()
         self.assertEqual(self.costs("on", "--force")[0], 0)
         self.assertEqual(self.read_settings()["env"]["OTEL_LOGS_EXPORTER"], "otlp")
         self.assertEqual(self.side()["previous"], {"OTEL_LOGS_EXPORTER": "console"})
@@ -185,7 +185,7 @@ class TestSendCosts(FeatureCase):
         self.assertEqual(self.read_settings(), original)
 
     def test_off_spares_hand_edited_values(self):
-        self.setup_ok()
+        self.setup_only()
         self.costs("on")
         s = self.read_settings()
         s["env"]["EXTRA"] = "mine"
@@ -194,7 +194,7 @@ class TestSendCosts(FeatureCase):
         self.assertEqual(self.read_settings(), {"env": {"EXTRA": "mine"}})
 
     def test_invalid_settings_refused_on_and_off(self):
-        self.setup_ok()
+        self.setup_only()
         self.write_settings("{broken")
         for a in ("on", "off"):
             self.assertEqual(self.costs(a)[0], 1)
@@ -204,40 +204,40 @@ class TestSendCosts(FeatureCase):
     def test_off_is_idempotent_and_safe_unconfigured(self):
         self.assertEqual(self.costs("off")[0], 0)
         self.assertFalse(os.path.exists(self.sidecar))
-        self.setup_ok()
+        self.setup_only()
         self.assertEqual(self.costs("off")[0], 0)
         self.assertEqual(self.costs("off")[0], 0)
 
     def test_off_does_not_touch_openspec_flag(self):
-        self.setup_ok()
+        self.setup_only()
         self.costs("on")
         self.openspec("on")
         self.costs("off")
         self.assertEqual(self.side()["features"], {"costs": False, "openspec": True})
 
     def test_bad_argument(self):
-        self.setup_ok()
+        self.setup_only()
         rc, _, _ = self.costs("maybe")
         self.assertEqual(rc, 2)
 
     def test_token_never_printed(self):
-        tok = self.setup_ok()
+        tok = self.setup_only()
         for a in ("on", "status", "off"):
             rc, out, err = self.costs(a)
             self.assertNotIn(tok, out + err)
 
     def test_status_subcommand(self):
-        self.setup_ok()
-        self.assertIn("costs: disabled", self.costs("status")[1])
+        self.setup_only()
+        self.assertIn("traces: disabled", self.costs("status")[1])
         self.costs("on")
         out = self.costs("status")[1]
-        self.assertIn("costs: enabled", out)
+        self.assertIn("traces: enabled", out)
         self.assertIn("prompt excerpt", out)
         self.assertEqual(self.side()["features"]["costs"], True)  # status is read-only
 
     def test_uninstall_removes_everything_even_when_off(self):
         self.write_settings({"model": "m"})
-        self.setup_ok()
+        self.setup_only()
         self.costs("on")
         self.costs("off")
         self.assertEqual(self.run_cli(["uninstall"])[0], 0)
@@ -248,7 +248,7 @@ class TestSendCosts(FeatureCase):
     def test_uninstall_after_on_restores(self):
         original = {"model": "m"}
         self.write_settings(original)
-        self.setup_ok()
+        self.setup_only()
         self.costs("on")
         self.run_cli(["uninstall"])
         self.assertEqual(self.read_settings(), original)
@@ -263,7 +263,7 @@ class TestSendOpenspec(FeatureCase):
 
     def test_flag_flips_only(self):
         self.write_settings({"model": "m"})
-        self.setup_ok()
+        self.setup_only()
         before = slurp(self.settings)
         rc, out, err = self.openspec()  # default on
         self.assertEqual(rc, 0, err)
@@ -276,7 +276,7 @@ class TestSendOpenspec(FeatureCase):
         self.assertEqual(self.side()["version"], cc.VERSION)
 
     def test_on_leaves_costs_alone(self):
-        self.setup_ok()
+        self.setup_only()
         self.costs("on")
         self.openspec("on")
         self.openspec("off")
@@ -284,7 +284,7 @@ class TestSendOpenspec(FeatureCase):
         self.assertEqual(len(self.read_settings()["env"]), 9)
 
     def test_status_subcommand_mentions_what_is_sent(self):
-        self.setup_ok()
+        self.setup_only()
         out = self.openspec("status")[1]
         self.assertIn("openspec: disabled", out)
         self.openspec("on")
@@ -293,7 +293,7 @@ class TestSendOpenspec(FeatureCase):
         self.assertIn("sync", out)
 
     def test_openspec_only_mentions_registration_exception(self):
-        self.setup_ok()
+        self.setup_only()
         self.openspec("on")
         self.assertIn("registration", self.openspec("status")[1])
         self.assertIn("registration", self.run_cli(["status"])[1])
@@ -310,19 +310,19 @@ class TestSendOpenspec(FeatureCase):
 
 class TestStatusDoctor(FeatureCase):
     def test_status_both_off_after_setup(self):
-        self.setup_ok()
+        self.setup_only()
         rc, out, _ = self.run_cli(["status"])
-        self.assertIn("costs: disabled", out)
+        self.assertIn("traces: disabled", out)
         self.assertIn("openspec: disabled", out)
-        self.assertIn("/company-cost:send-costs", out)
+        self.assertIn("/company-cost:send-traces", out)
         self.assertIn("/company-cost:send-openspec", out)
         self.assertNotIn("MISSING", out)
 
     def test_status_costs_on_checks_managed_keys(self):
-        self.setup_ok()
+        self.setup_only()
         self.costs("on")
         out = self.run_cli(["status"])[1]
-        self.assertIn("costs: enabled", out)
+        self.assertIn("traces: enabled", out)
         self.assertIn("Managed keys: present", out)
         s = self.read_settings()
         del s["env"]["OTEL_LOGS_EXPORTER"]
@@ -330,10 +330,10 @@ class TestStatusDoctor(FeatureCase):
         self.assertIn("MISSING", self.run_cli(["status"])[1])
 
     def test_doctor_lists_features(self):
-        self.setup_ok()
+        self.setup_only()
         self.openspec("on")
         out = self.run_cli(["doctor"])[1]
-        self.assertIn("costs: disabled", out)
+        self.assertIn("traces: disabled", out)
         self.assertIn("openspec: enabled", out)
 
 

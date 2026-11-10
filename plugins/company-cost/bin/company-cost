@@ -3,7 +3,7 @@
 
 Commands:
   company-cost setup [--url U] [--token T] [--token-stdin] [--force] [--allow-insecure]
-  company-cost send-costs [on|off|status] [--force]      (default: on)
+  company-cost send-traces [on|off|status] [--force]      (default: on)
   company-cost send-openspec [on|off|status]             (default: on)
   company-cost uninstall
   company-cost status
@@ -440,6 +440,7 @@ def load_config():
 
 
 FEATURES = ("costs", "openspec")
+FEATURE_LABEL = {"costs": "traces", "openspec": "openspec"}  # sidecar key `costs` is shown as "traces"
 FEATURE_SENDS = {
     "costs": "OTEL telemetry keys in settings.json; session start/heartbeat/end events "
              "(project, branch, cwd hash); redacted prompt excerpt (max 200 chars)",
@@ -1125,7 +1126,19 @@ def _queue_restore(claim, unsent):
         return lk.held
 
 
-def flush_queue(cfg, budget=QUEUE_FLUSH_BUDGET):
+def _item_allowed(flags, suffix, payload):
+    """Queued items of a disabled feature are dropped instead of sent."""
+    if flags is None:
+        return True
+    if suffix == "snapshot":
+        return flags["openspec"]
+    if flags["costs"]:
+        return True
+    # openspec-only: the only session event allowed is the registration `start`
+    return suffix == "session" and payload.get("event") == "start"
+
+
+def flush_queue(cfg, budget=QUEUE_FLUSH_BUDGET, flags=None):
     try:
         if in_backoff(load_state()) or not (os.path.exists(_queue_path()) or _claim_files()):
             return
@@ -1143,6 +1156,8 @@ def flush_queue(cfg, budget=QUEUE_FLUSH_BUDGET):
                 item = json.loads(ln.decode("utf-8"))
                 suffix, payload = item["path"], item["payload"]
                 if suffix not in _QUEUE_SUFFIXES or not isinstance(payload, dict):
+                    continue
+                if not _item_allowed(flags, suffix, payload):
                     continue
             except Exception:
                 continue
@@ -1164,17 +1179,20 @@ def flush_queue(cfg, budget=QUEUE_FLUSH_BUDGET):
 # Hooks
 # ---------------------------------------------------------------------------
 def _session_payload(event, sid, ident, cwd, change, source):
-    return {
+    """change/source None => the openspec feature is off: the change fields are omitted entirely."""
+    body = {
         "event": event,
         "session_id": sid,
         "project_key": ident["key"],
         "project_name": ident["name"],
         "branch": ident["branch"],
         "repo_display": ident["repo_display"],
-        "change_name": change,
-        "change_source": source,
         "cwd_hash": cwd_hash(cwd),
     }
+    if change is not None:
+        body["change_name"] = change
+        body["change_source"] = source
+    return body
 
 
 def _sync_key(project_key, branch):
@@ -1212,6 +1230,10 @@ def maybe_spawn_sync(ident, cwd, force):
 
 
 def run_hook(event, data):
+    flags = feature_flags(read_sidecar())
+    costs, spec = flags["costs"], flags["openspec"]
+    if not (costs or spec):
+        return  # gate before any network, git or subprocess work
     cfg = load_config()
     if not cfg or not isinstance(data, dict):
         return
@@ -1222,10 +1244,9 @@ def run_hook(event, data):
     cwd = data.get("cwd") if isinstance(data.get("cwd"), str) and data.get("cwd") else os.getcwd()
     if event not in ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"):
         return
-    prompt = data.get("prompt") if event == "UserPromptSubmit" else None
-    if prompt is not None and not isinstance(prompt, str):
-        prompt = None
     if event == "SessionEnd":
+        if not costs:
+            return  # openspec-only: no end event
         # Send first, never run openspec: use only what earlier hooks cached.
         meta = session_meta(sid)
         cached = meta.get("ident")
@@ -1234,25 +1255,38 @@ def run_hook(event, data):
             ident = cached
         else:
             ident = project_identity(cwd)
-        change, source = "", ""
-        if isinstance(meta.get("change"), str) and meta["change"]:
-            change, source = meta["change"], "command"
-        else:
-            inf = meta.get("infer")
-            if isinstance(inf, dict) and isinstance(inf.get("change"), str) and isinstance(inf.get("source"), str):
-                change, source = inf["change"], inf["source"]
+        change, source = (None, None)
+        if spec:
+            change, source = "", ""
+            if isinstance(meta.get("change"), str) and meta["change"]:
+                change, source = meta["change"], "command"
+            else:
+                inf = meta.get("infer")
+                if isinstance(inf, dict) and isinstance(inf.get("change"), str) \
+                        and isinstance(inf.get("source"), str):
+                    change, source = inf["change"], inf["source"]
         send(cfg, "session", _session_payload("end", sid, ident, cwd, change, source), TIMEOUT_SESSION_END)
         return
+    if event == "UserPromptSubmit" and not costs:
+        return  # openspec-only sends nothing per prompt
+    prompt = data.get("prompt") if event == "UserPromptSubmit" else None
+    if prompt is not None and not isinstance(prompt, str):
+        prompt = None
     ident = project_identity(cwd)
     if event == "SessionStart":
         session_meta_update(sid, ident=_clean_ident(ident))
-    change, source = resolve_change(sid, cwd, ident, prompt)
+    change, source = (None, None)
+    if spec and (event != "Stop" or costs):
+        change, source = resolve_change(sid, cwd, ident, prompt)
     _DEADLINE[0] = None
 
     if event == "SessionStart":
+        # With openspec-only this single `start` is the project registration the server needs
+        # before it accepts sync/plan (409 unknown_project otherwise).
         send(cfg, "session", _session_payload("start", sid, ident, cwd, change, source), TIMEOUT_SESSION_START)
-        flush_queue(cfg)
-        maybe_spawn_sync(ident, cwd, force=True)
+        flush_queue(cfg, flags=flags)
+        if spec:
+            maybe_spawn_sync(ident, cwd, force=True)
     elif event == "UserPromptSubmit":
         send(cfg, "session", _session_payload("heartbeat", sid, ident, cwd, change, source), TIMEOUT_HEARTBEAT)
         excerpt = ""
@@ -1261,13 +1295,19 @@ def run_hook(event, data):
         prompt = None
         data = None
         if excerpt:
-            send(cfg, "prompt", {"session_id": sid, "excerpt": excerpt, "change_name": change}, TIMEOUT_PROMPT)
+            body = {"session_id": sid, "excerpt": excerpt}
+            if change is not None:
+                body["change_name"] = change
+            send(cfg, "prompt", body, TIMEOUT_PROMPT)
     elif event == "Stop":
-        outcome = send(cfg, "session", _session_payload("heartbeat", sid, ident, cwd, change, source),
-                       TIMEOUT_HEARTBEAT)
-        maybe_spawn_sync(ident, cwd, force=False)
+        outcome = None
+        if costs:
+            outcome = send(cfg, "session", _session_payload("heartbeat", sid, ident, cwd, change, source),
+                           TIMEOUT_HEARTBEAT)
+        if spec:
+            maybe_spawn_sync(ident, cwd, force=False)
         if outcome == "ok" and queue_size() > 0:
-            flush_queue(cfg)
+            flush_queue(cfg, flags=flags)
 
 
 def hook_entry(argv):
@@ -1300,6 +1340,8 @@ def acquire_sync_lock(key):
 
 
 def run_sync(cwd):
+    if not feature_flags(read_sidecar())["openspec"]:
+        return
     cfg = load_config()
     if not cfg:
         return
@@ -1468,7 +1510,7 @@ def enable_costs(side, force, err):
             for k in conflicts:
                 err.write("  - %s\n" % k)
             err.write("Nothing was changed. Re-run with --force to override (old values are saved and restored on "
-                      "send-costs off / uninstall).\n")
+                      "send-traces off / uninstall).\n")
             return 1
         previous = dict((k, env[k]) for k in wanted if k in env)
     _make_backup(path) if existed else None
@@ -1497,13 +1539,13 @@ def do_setup(url, token, force, allow_insecure, out, err):
     out.write("company-cost connection saved.\n")
     out.write("  URL:   %s\n  token: set (hidden)\n" % url)
     if feats["costs"]:
-        out.write("  Refreshed the managed keys in %s (costs is on). Restart Claude Code.\n" % settings_path())
+        out.write("  Refreshed the managed keys in %s (traces is on). Restart Claude Code.\n" % settings_path())
     if not any(feats.values()):
         out.write("Nothing is sent yet and settings.json was not touched. Next steps:\n")
     else:
-        out.write("Features: costs %s, openspec %s. Next steps (optional):\n"
+        out.write("Features: traces %s, openspec %s. Next steps (optional):\n"
                   % tuple("on" if feats[k] else "off" for k in FEATURES))
-    out.write("  /company-cost:send-costs      cost telemetry + sessions + prompt excerpt\n")
+    out.write("  /company-cost:send-traces      cost telemetry + sessions + prompt excerpt\n")
     out.write("  /company-cost:send-openspec   OpenSpec change tracking and file mirror\n")
     return 0
 
@@ -1519,13 +1561,13 @@ def _flip_feature(feature, value):
 
 def _describe(feature, flags, out):
     on = flags[feature]
-    out.write("%s: %s\n" % (feature, "enabled" if on else "disabled"))
+    out.write("%s: %s\n" % (FEATURE_LABEL[feature], "enabled" if on else "disabled"))
     out.write("  sends: %s\n" % FEATURE_SENDS[feature])
     if flags["openspec"] and not flags["costs"] and feature == "openspec" and on:
         out.write("  %s\n" % REGISTRATION_NOTE)
 
 
-def do_send_costs(action, force, out, err):
+def do_send_traces(action, force, out, err):
     side = read_sidecar()
     flags = feature_flags(side)
     if action == "status":
@@ -1533,7 +1575,7 @@ def do_send_costs(action, force, out, err):
         return 0
     if action == "on":
         if _is_windows():
-            err.write("error: company-cost send-costs supports macOS/Linux/WSL only.\n")
+            err.write("error: company-cost send-traces supports macOS/Linux/WSL only.\n")
             return 1
         cfg = load_config()
         if not cfg:
@@ -1547,13 +1589,13 @@ def do_send_costs(action, force, out, err):
         if rc:
             return rc
         clear_auth_state()
-        out.write("costs: enabled\n  sends: %s\n" % FEATURE_SENDS["costs"])
+        out.write("traces: enabled\n  sends: %s\n" % FEATURE_SENDS["costs"])
         out.write("Wrote %d keys to the env block of %s\n" % (len(MANAGED_ENV_KEYS), settings_path()))
         out.write("Restart Claude Code for the telemetry settings to take effect.\n")
         return 0
     # off
     if not side and not load_config():
-        out.write("costs: disabled (nothing configured)\n")
+        out.write("traces: disabled (nothing configured)\n")
         return 0
     path = settings_path()
     settings, existed, problem = load_settings(path)
@@ -1568,7 +1610,7 @@ def do_send_costs(action, force, out, err):
     flags["costs"] = False
     new["features"] = flags
     save_sidecar(new)
-    out.write("costs: disabled\n  Removed the managed keys from %s (previous values restored); "
+    out.write("traces: disabled\n  Removed the managed keys from %s (previous values restored); "
               "URL and token are kept.\n" % path)
     out.write("Restart Claude Code so the telemetry settings stop being read.\n")
     return 0
@@ -1734,7 +1776,7 @@ def do_status(out):
     for name in FEATURES:
         _describe(name, flags, out)
     if not any(flags.values()):
-        out.write("Nothing is being sent. Enable with /company-cost:send-costs and/or /company-cost:send-openspec\n")
+        out.write("Nothing is being sent. Enable with /company-cost:send-traces and/or /company-cost:send-openspec\n")
     if flags["costs"]:
         settings, _, _ = load_settings(settings_path())
         env = (settings or {}).get("env")
@@ -1744,7 +1786,7 @@ def do_status(out):
         if env.get(SENTINEL_KEY) == "1" and not missing:
             out.write("Managed keys: present (%d)\n" % len(keys))
         else:
-            out.write("Managed keys: MISSING%s (run /company-cost:send-costs)\n"
+            out.write("Managed keys: MISSING%s (run /company-cost:send-traces)\n"
                       % (" " + ",".join(missing) if missing else ""))
         ep = env.get("OTEL_EXPORTER_OTLP_ENDPOINT")
         if ep and ep != cfg["url"] + "/v1/otlp":
@@ -1784,7 +1826,7 @@ def do_doctor(out):
     out.write("configured: %s\n" % ("yes" if load_config() else "no"))
     flags = feature_flags(read_sidecar())
     for name in FEATURES:
-        out.write("%s: %s\n" % (name, "enabled" if flags[name] else "disabled"))
+        out.write("%s: %s\n" % (FEATURE_LABEL[name], "enabled" if flags[name] else "disabled"))
     return 0
 
 
@@ -1842,18 +1884,18 @@ def main(argv=None):
         sys.stdout.write(__doc__)
         return 0 if argv else 1
     cmd, rest = argv[0], argv[1:]
-    if cmd in ("setup", "status", "doctor", "send-costs", "send-openspec"):
+    if cmd in ("setup", "status", "doctor", "send-traces", "send-openspec"):
         use_discovered_data_dir()
     if cmd == "setup":
         return cmd_setup(rest)
-    if cmd in ("send-costs", "send-openspec"):
+    if cmd in ("send-traces", "send-openspec"):
         ap = argparse.ArgumentParser(prog="company-cost " + cmd)
         ap.add_argument("action", nargs="?", default="on", choices=("on", "off", "status"))
-        if cmd == "send-costs":
+        if cmd == "send-traces":
             ap.add_argument("--force", action="store_true")
         args = ap.parse_args(rest)
-        if cmd == "send-costs":
-            return do_send_costs(args.action, args.force, sys.stdout, sys.stderr)
+        if cmd == "send-traces":
+            return do_send_traces(args.action, args.force, sys.stdout, sys.stderr)
         return do_send_openspec(args.action, sys.stdout, sys.stderr)
     if cmd == "uninstall":
         return do_uninstall(sys.stdout, sys.stderr)

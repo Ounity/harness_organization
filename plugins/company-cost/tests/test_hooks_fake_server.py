@@ -597,6 +597,11 @@ class TestCliSubprocess(HookCase):
                            stderr=subprocess.PIPE, timeout=30)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertNotIn(self.token.encode(), p.stdout + p.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.cfg, "settings.json")))  # setup alone: no settings
+        p = subprocess.run([sys.executable, SCRIPT, "send-traces"], env=env, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, timeout=30)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn(self.token.encode(), p.stdout + p.stderr)
         settings = json.loads(slurp(os.path.join(self.cfg, "settings.json")))
         self.assertEqual(len(settings["env"]), 9)
         # the sidecar alone now configures hooks (no env options)
