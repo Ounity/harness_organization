@@ -140,8 +140,24 @@ class TestIdentityAndVersion(unittest.TestCase):
                 names.add((node.module or "").split(".")[0])
         stdlib = getattr(sys, "stdlib_module_names", None)
         if stdlib is None:
-            stdlib = {"argparse", "getpass", "hashlib", "json", "os", "re", "shutil", "subprocess",
-                      "sys", "time", "urllib"}
+            # Python < 3.10 has no stdlib_module_names: classify by where the
+            # module lives (built-in, or under the stdlib dir but not site-packages).
+            import importlib.util
+            import sysconfig
+            std_dir = os.path.realpath(sysconfig.get_paths()["stdlib"])
+
+            def is_stdlib(name):
+                if name in sys.builtin_module_names:
+                    return True
+                spec = importlib.util.find_spec(name)
+                if spec is None:
+                    return False
+                if spec.origin in ("built-in", "frozen"):
+                    return True
+                origin = os.path.realpath(spec.origin or "")
+                return origin.startswith(std_dir) and "site-packages" not in origin
+
+            stdlib = {n for n in names if is_stdlib(n)}
         self.assertTrue(names)
         self.assertEqual(sorted(n for n in names if n not in stdlib), [])
 
