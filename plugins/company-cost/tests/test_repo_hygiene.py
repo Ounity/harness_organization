@@ -12,6 +12,7 @@ SCRIPT = os.path.join(PLUGIN, "bin", "company-cost")
 SKIP_DIRS = {".git", ".atl", "__pycache__", "tests"}
 SKIP_FILES = {"CONTRIBUTING.md", "ci.yml", ".DS_Store", "icon.png"}
 FORBIDDEN = ("acme", "192.168", "gitea", "pedro", "garcia", "unlicensed", "co-authored-by")
+ALL_SKILLS = ("setup", "status", "uninstall", "send-traces", "send-openspec")
 ALLOWED_USERCONFIG_KEYS = {"type", "title", "description", "required", "default", "sensitive",
                            "multiple", "min", "max"}
 
@@ -88,12 +89,24 @@ class Manifests(unittest.TestCase):
 
     def test_userconfig_keys(self):
         cfg = self.plugin["userConfig"]
-        self.assertEqual(set(cfg), {"RAG_URL", "RAG_TOKEN"})
+        self.assertEqual(set(cfg), {"RAG_URL", "RAG_TOKEN", "AGENT_NAME", "ENVIRONMENT", "TASK"})
         for name, opt in cfg.items():
             for key in ("type", "title", "description"):
                 self.assertIn(key, opt, name)
             self.assertLessEqual(set(opt), ALLOWED_USERCONFIG_KEYS, name)
         self.assertTrue(cfg["RAG_TOKEN"].get("sensitive"))
+        agent = cfg["AGENT_NAME"]
+        self.assertEqual(agent["type"], "string")
+        self.assertFalse(agent.get("required"))
+        self.assertFalse(agent.get("sensitive"))
+        taskopt = cfg["TASK"]
+        self.assertEqual(taskopt["type"], "string")
+        self.assertFalse(taskopt.get("required"))
+        self.assertFalse(taskopt.get("sensitive"))
+        envopt = cfg["ENVIRONMENT"]
+        self.assertEqual(envopt["type"], "string")
+        self.assertFalse(envopt.get("required"))
+        self.assertFalse(envopt.get("sensitive"))
 
     def test_marketplace(self):
         self.assertEqual(self.market["name"], "ounity-plugins")
@@ -153,22 +166,61 @@ class Skills(unittest.TestCase):
             return f.read()
 
     def test_frontmatter(self):
-        for name in ("setup", "status", "uninstall"):
+        for name in ALL_SKILLS:
             fm = frontmatter(self.read(name))
             self.assertIsNotNone(fm, name)
             self.assertEqual(fm["name"], name)
             self.assertTrue(fm["description"])
-        for name in ("setup", "uninstall"):
+        for name in ("setup", "uninstall", "send-traces", "send-openspec"):
             self.assertEqual(frontmatter(self.read(name))["disable-model-invocation"], "true")
 
+    def test_skill_dirs_match(self):
+        dirs = sorted(d for d in os.listdir(os.path.join(PLUGIN, "skills"))
+                      if os.path.isdir(os.path.join(PLUGIN, "skills", d)))
+        self.assertEqual(dirs, sorted(ALL_SKILLS))
+
+    def test_feature_skills_arguments_and_restart(self):
+        for name in ("send-traces", "send-openspec"):
+            text = self.read(name)
+            self.assertIn("$ARGUMENTS", text, name)
+            self.assertIn("on|off", text, name)
+            self.assertIn("Bash(company-cost %s:*)" % name, text)
+            self.assertIn('Bash(python3 "${CLAUDE_PLUGIN_ROOT}/bin/company-cost" %s:*)' % name, text)
+            self.assertIn("NEVER print", text, name)
+        self.assertIn("Restart Claude Code", self.read("send-traces"))
+
+    def test_feature_skills_validate_arguments(self):
+        for name in ("send-traces", "send-openspec"):
+            text = self.read(name)
+            self.assertIn("exactly `on`, `off` or `status`", text, name)
+            self.assertIn("stop and ask the user", text, name)
+            self.assertIn("Never take `--force`", text, name)
+            for block in re.findall(r"```bash\n(.*?)```", text, re.S):
+                self.assertNotIn("$ARGUMENTS", block, name)
+        self.assertIn("never comes from `$ARGUMENTS`", self.read("send-traces"))
+
     def test_no_bare_python_allowed_tools(self):
-        for name in ("setup", "status", "uninstall"):
+        for name in ALL_SKILLS:
             self.assertNotIn("python3:*", self.read(name), name)
 
     def test_setup_uses_stdin_token(self):
         text = self.read("setup")
         self.assertIn("--token-stdin", text)
         self.assertIsNone(re.search(r"--token(?![-\w])", text.replace("`--token`", "")))
+
+    def test_setup_agent_name_quoting_guidance(self):
+        text = self.read("setup")
+        self.assertIn("--agent='<NAME>'", text)  # single-quoted, attached with `=`
+        self.assertIn("A-Z a-z 0-9", text)  # allowed character set spelled out
+        self.assertIn("refuse", text.lower())
+        self.assertIn("optional", text.lower())
+        self.assertIn("--environment='<ENV>'", text)
+        self.assertNotIn('--environment "', text)
+        self.assertIn("--task='<TASK>'", text)
+        self.assertNotIn('--task "', text)
+        self.assertIn("`/` and `=` are NOT allowed, they are delimiters", text)
+        self.assertIn("REFUSE anything else, including `/` and `=`", text)
+        self.assertNotIn('--agent "', text)  # never double-quoted (shell expansion)
 
     def test_uninstall_order(self):
         text = self.read("uninstall")

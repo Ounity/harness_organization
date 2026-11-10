@@ -2,6 +2,38 @@
 
 All notable changes are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [SemVer](https://semver.org/). Releases are tagged `vX.Y.Z`.
 
+## [0.3.0] - 2026-11-10
+
+### Added
+- Three optional labels: agent name, environment and task. `company-cost setup --agent NAME --environment ENV --task TASK` (`""` clears one; omitting keeps the stored value), stored in the sidecar as `agent_name`, `environment` and `task`, with the plugin options `AGENT_NAME`, `ENVIRONMENT` and `TASK` as fallbacks when the sidecar has none.
+- When set, every session event (`start`, `heartbeat`, `end`, and the lone `start` of openspec-only mode) carries `user_ref` = `agent:` plus the set fields as `env=<environment>/name=<name>/task=<task>` in that order (for example `agent:env=prod/name=mi-agente/task=deploy`); unset fields are omitted and `user_ref` is omitted when all are unset. Parse: strip `agent:`, split on `/`, each part is `key=value`. Prompt, snapshot and sync payloads are unchanged. They are labels, not filters.
+- Per-session task: every hook reads the `COMPANY_COST_TASK` environment variable, which overrides the sidecar `task`, which overrides the `TASK` plugin option (unset or empty means not provided; a non-empty but invalid `COMPANY_COST_TASK` omits the task segment instead of falling through to the defaults; invalid sidecar/option values are skipped). Meant for workflow nodes that each launch their own Claude Code session.
+- Validation (all three): 1 to 48 characters, letters/digits/space and `. _ - :` (`/` and `=` are delimiters and rejected), no control characters, nothing the prompt redaction would alter. Worst-case `user_ref` is 166 characters.
+- `status` and `doctor` show `Agent name`, `Environment`, `Task` (with its source) and the exact `user_ref` sent; the `setup` skill asks for all three (optional) with strict quoting rules.
+
+## [0.2.0] - 2026-11-10
+
+### Added
+- Two independent, persistent feature switches: **traces** (OTEL cost export, session events, redacted prompt excerpt) and **openspec** (change inference, OpenSpec file mirror, snapshot).
+- Skills `/company-cost:send-traces` and `/company-cost:send-openspec`, and CLI `company-cost send-traces [on|off|status]` / `company-cost send-openspec [on|off|status]` (`on` is the default).
+- Sidecar `features` object; `status` and `doctor` show each feature and what it sends.
+- Hook gating: with both features off every hook is a silent no-op; with traces only, no change fields are sent and no `openspec` command, sync or snapshot runs.
+- openspec-only mode sends exactly one session `start` event per session as project registration (the server rejects `sync/plan` with `409 unknown_project` otherwise); no heartbeat, end or prompt excerpt.
+
+### Changed
+- BREAKING-ISH: `setup` now only stores the connection (URL, token) and no longer writes `settings.json` or enables anything. It prints the next steps. Run `/company-cost:send-traces` to get the old `setup` behavior (same 9 keys, backup, `--force` rule, restore on `off`/uninstall).
+- Queued items that belong to a disabled feature are dropped instead of sent.
+- `send-traces off` keeps URL and token in the sidecar; `uninstall` still removes everything.
+
+- A missing, empty or unparseable sidecar (for example plugin-option-only configuration) now means both features OFF: nothing is sent without an explicit opt-in.
+- `send-traces off` persists the flag first, so a broken `settings.json` can no longer leave traces on (exit 1 tells you the OTEL keys remain). It restores `env` exactly, keeping an original empty object.
+- Queued items are sanitized when flushed: `change_name` / `change_source` are stripped once openspec is off.
+- `send-traces on` writes `settings.json` before flipping the flag, and sidecar changes are serialized with a lock.
+- The `send-traces` / `send-openspec` skills only accept the exact words `on`, `off` or `status` and never take `--force` from their argument; the conflict hint points to `send-traces on --force` after an explicit yes.
+
+### Migration from 0.1.0
+Existing installs keep working: a sidecar with `url` and without a `features` key (written by 0.1.0) is treated as both features enabled. Use `send-traces off` / `send-openspec off` to narrow it.
+
 ## [0.1.0] - 2026-11-10
 
 Initial public release.

@@ -1,7 +1,7 @@
 {
   "name": "company-cost",
   "displayName": "Company Cost",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Reports Claude Code cost telemetry and OpenSpec progress to an ingest service you configure.",
   "author": {
     "name": "Ounity",
@@ -24,6 +24,24 @@
       "title": "Ingest service token",
       "description": "Bearer token issued by your ingest service (starts with hro_)",
       "sensitive": true,
+      "required": false
+    },
+    "AGENT_NAME": {
+      "type": "string",
+      "title": "Agent name",
+      "description": "Optional label for the agent being monitored. Sent with each session event as user_ref (agent:name=<name>); not a filter and not a secret. Max 48 characters: letters, digits, space and . _ - :",
+      "required": false
+    },
+    "ENVIRONMENT": {
+      "type": "string",
+      "title": "Environment",
+      "description": "Optional environment label (dev, staging, prod...). Sent with each session event inside user_ref as agent:env=<environment>/name=<name>; not a secret. Max 48 characters: letters, digits, space and . _ - :",
+      "required": false
+    },
+    "TASK": {
+      "type": "string",
+      "title": "Task",
+      "description": "Optional default task label. Overridden per session by the COMPANY_COST_TASK environment variable. Sent inside user_ref as task=<task>; not a secret. Max 48 characters: letters, digits, space and . _ - :",
       "required": false
     }
   }
