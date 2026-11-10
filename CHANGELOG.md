@@ -5,10 +5,10 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 ## [0.3.0] - 2026-11-10
 
 ### Added
-- Optional agent name: `company-cost setup --agent NAME` (`--agent ""` clears it; omitting it keeps the stored value), stored in the sidecar as `agent_name`, with the plugin option `AGENT_NAME` as a fallback when the sidecar has none.
-- When set, every session event (`start`, `heartbeat`, `end`, and the lone `start` of openspec-only mode) carries `user_ref` = `agent:<name>`; when unset `user_ref` is still omitted. Prompt, snapshot and sync payloads are unchanged. It is a label, not a filter.
-- Validation: 1 to 64 characters, letters/digits/space and `. _ - : /`, no control characters, nothing the prompt redaction would alter.
-- `status` and `doctor` show `Agent name`; the `setup` skill asks for it (optional) with strict quoting rules.
+- Optional agent name and environment: `company-cost setup --agent NAME --environment ENV` (`""` clears either; omitting keeps the stored value), stored in the sidecar as `agent_name` and `environment`, with the plugin options `AGENT_NAME` and `ENVIRONMENT` as fallbacks when the sidecar has none.
+- When set, every session event (`start`, `heartbeat`, `end`, and the lone `start` of openspec-only mode) carries `user_ref`: `agent:<environment>/<name>`, `agent:<name>` (no environment), `agent:<environment>/` (no name; `agent:` stays a fixed prefix) or omitted when neither is set. Prompt, snapshot and sync payloads are unchanged. They are labels, not filters.
+- Validation (both): 1 to 64 characters, letters/digits/space and `. _ - :` (no `/`, it is the delimiter), no control characters, nothing the prompt redaction would alter.
+- `status` and `doctor` show `Agent name`, `Environment` and the exact `user_ref` sent; the `setup` skill asks for both (optional) with strict quoting rules.
 
 ## [0.2.0] - 2026-11-10
 

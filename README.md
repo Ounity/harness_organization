@@ -50,7 +50,7 @@ claude plugin install company-cost@ounity-plugins
 
 ## Setup
 
-In Claude Code run `/company-cost:setup`. It asks for the service URL (for example `https://ingest.example.com`) and your token (`hro_REDACTED`) and stores them in `settings.company-cost.json` (mode 600). **Setup does not enable anything**: it does not touch `settings.json` and nothing is sent. It prints the next steps: `/company-cost:send-traces` and `/company-cost:send-openspec`. It also asks, optionally, for the [agent name](#agent-name) being monitored.
+In Claude Code run `/company-cost:setup`. It asks for the service URL (for example `https://ingest.example.com`) and your token (`hro_REDACTED`) and stores them in `settings.company-cost.json` (mode 600). **Setup does not enable anything**: it does not touch `settings.json` and nothing is sent. It prints the next steps: `/company-cost:send-traces` and `/company-cost:send-openspec`. It also asks, optionally, for the [agent name and environment](#agent-name-and-environment).
 
 Equivalent from a terminal (the token goes through stdin, never argv):
 
@@ -58,21 +58,31 @@ Equivalent from a terminal (the token goes through stdin, never argv):
 printf '%s\n' "$TOKEN" | company-cost setup --url https://ingest.example.com --token-stdin
 ```
 
-Add `--agent 'NAME'` (or `--agent=NAME`) to set the optional agent name; see [Agent name](#agent-name).
+Add `--agent 'NAME'` and/or `--environment 'ENV'` (or the `--agent=NAME` form) to set the optional labels; see [Agent name and environment](#agent-name-and-environment).
 
 Plain `http://` to a non-local host is refused unless `--allow-insecure` is passed. Re-running `setup` with a new token keeps your feature switches; if traces is on it also refreshes the token in `settings.json`.
 
-## Agent name
+## Agent name and environment
 
-An optional label that says which agent this installation monitors, so the service can attribute usage to it.
+Two optional labels that tell the service which agent this installation monitors and which environment (dev, staging, prod...) it runs in, so usage can be attributed.
 
-- **What it is**: a label, not a filter. All sessions are still monitored; the name only travels with them.
-- **Set it**: `/company-cost:setup`, or `company-cost setup --agent 'Code Reviewer'`. Re-running `setup` with `--agent` replaces it, `--agent ""` clears it, and omitting `--agent` keeps the stored value. The plugin option `AGENT_NAME` (env `CLAUDE_PLUGIN_OPTION_AGENT_NAME`) is used only when the sidecar has no name; the sidecar wins.
-- **Rules**: 1 to 64 characters after trimming; letters, digits, space and `. _ - : /`. Control characters and anything that the prompt redaction would alter (secret-looking text) are rejected, and setup exits 1 without changing anything.
-- **Where it is sent**: in the `user_ref` field of every `session` event (`start`, `heartbeat`, `end`, and the lone `start` of openspec-only mode) as `agent:<name>`, only when a name is set; otherwise `user_ref` is omitted as before. Prompt, snapshot and sync payloads do not carry it. Queued session events keep the value they were built with.
-- **Visibility**: it is plain text visible to whoever operates the service. It is not a secret; do not put one in it.
-- **Caution**: this reuses the service's optional `user_ref` field. The field's purpose on the server is not documented in this repo. If your service uses `user_ref` for end-user identity, tell its operator before you set an agent name.
-- `/company-cost:status` and `company-cost doctor` show `Agent name: <name>` or `not set`. `uninstall` removes it with the sidecar.
+- **What they are**: labels, not filters. All sessions are still monitored; the labels only travel with them.
+- **Set them**: `/company-cost:setup`, or `company-cost setup --agent 'Code Reviewer' --environment 'prod'`. For each option, re-running `setup` with it replaces the value, `""` clears it, and omitting it keeps the stored value. The plugin options `AGENT_NAME` and `ENVIRONMENT` (env `CLAUDE_PLUGIN_OPTION_AGENT_NAME` / `CLAUDE_PLUGIN_OPTION_ENVIRONMENT`) are used only when the sidecar has no value; the sidecar wins.
+- **Rules (both)**: 1 to 64 characters after trimming; letters, digits, space and `. _ - :`. `/` is NOT allowed because it is the delimiter below. Control characters and anything the prompt redaction would alter (secret-looking text) are rejected; setup exits 1 without changing anything.
+- **Where they are sent**: in the `user_ref` field of every `session` event (`start`, `heartbeat`, `end`, and the lone `start` of openspec-only mode). Prompt, snapshot and sync payloads do not carry it. Queued session events keep the value they were built with.
+
+| Agent name | Environment | `user_ref` |
+|------------|-------------|------------|
+| `planner` | `prod` | `agent:prod/planner` |
+| `planner` | not set | `agent:planner` |
+| not set | `prod` | `agent:prod/` |
+| not set | not set | omitted |
+
+`agent:` is a fixed prefix, even when only the environment is set (that is the chosen format). A consumer can split the part after the prefix on the first `/`: if there is one, the left side is the environment and the right side the name (possibly empty); if not, the whole value is the name.
+
+- **Visibility**: plain text visible to whoever operates the service. They are not secrets; do not put one in them.
+- **Caution**: this reuses the service's optional `user_ref` field. The field's purpose on the server is not documented in this repo. If your service uses `user_ref` for end-user identity, tell its operator before you set either value.
+- `/company-cost:status` and `company-cost doctor` show `Agent name`, `Environment` and the exact `user_ref` that will be sent. `uninstall` removes them with the sidecar.
 
 ## Choose what is sent
 
@@ -185,7 +195,7 @@ Authentication: `Authorization: Bearer hro_...` on every request. All plugin req
 | Endpoint | Purpose |
 |----------|---------|
 | `/v1/otlp` (+ `/v1/logs` appended by the exporter) | OTLP http/json log events (cost) |
-| `/v1/ingest/plugin/session` | session start / heartbeat / end (optional `user_ref`: `agent:<name>` when an agent name is set) |
+| `/v1/ingest/plugin/session` | session start / heartbeat / end (optional `user_ref`: `agent:<environment>/<name>`, see [Agent name and environment](#agent-name-and-environment)) |
 | `/v1/ingest/plugin/prompt` | redacted prompt excerpt |
 | `/v1/ingest/plugin/snapshot` | OpenSpec change snapshot |
 | `/v1/ingest/plugin/sync/plan` | receives file manifest, returns `{"upload": [paths], "delete": [paths]}` |
