@@ -16,8 +16,14 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 - Queued items that belong to a disabled feature are dropped instead of sent.
 - `send-traces off` keeps URL and token in the sidecar; `uninstall` still removes everything.
 
+- A missing, empty or unparseable sidecar (for example plugin-option-only configuration) now means both features OFF: nothing is sent without an explicit opt-in.
+- `send-traces off` persists the flag first, so a broken `settings.json` can no longer leave traces on (exit 1 tells you the OTEL keys remain). It restores `env` exactly, keeping an original empty object.
+- Queued items are sanitized when flushed: `change_name` / `change_source` are stripped once openspec is off.
+- `send-traces on` writes `settings.json` before flipping the flag, and sidecar changes are serialized with a lock.
+- The `send-traces` / `send-openspec` skills only accept the exact words `on`, `off` or `status` and never take `--force` from their argument; the conflict hint points to `send-traces on --force` after an explicit yes.
+
 ### Migration from 0.1.0
-Existing installs keep working: a sidecar without `features` is treated as both features enabled. Use `send-traces off` / `send-openspec off` to narrow it.
+Existing installs keep working: a sidecar with `url` and without a `features` key (written by 0.1.0) is treated as both features enabled. Use `send-traces off` / `send-openspec off` to narrow it.
 
 ## [0.1.0] - 2026-11-10
 

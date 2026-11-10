@@ -71,9 +71,9 @@ Two independent, persistent switches. `on` is the default action when no argumen
 
 "Traces" covers the OTEL cost export, the session events and the prompt excerpt (the excerpt travels with the traces).
 
-**send-traces on** writes these keys into the `env` block of `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`): `CLAUDE_CODE_ENABLE_TELEMETRY`, `OTEL_LOGS_EXPORTER`, `OTEL_METRICS_EXPORTER`, `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_LOGS_EXPORT_INTERVAL`, `OTEL_METRICS_INCLUDE_REPOSITORY`, `COMPANY_COST_MANAGED` (marker). `settings.json` is rewritten atomically with owner-only permissions (mode 600; group/other bits are removed because the token lives there), after a one-time backup `settings.json.company-cost.bak` (kept until uninstall). If you already have different values for those keys it stops; `--force` overrides them and `send-traces off` (or uninstall) restores the old ones. **Restart Claude Code** after `send-traces on` or `off`: the OTEL environment is read at startup.
+**send-traces on** writes these keys into the `env` block of `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`): `CLAUDE_CODE_ENABLE_TELEMETRY`, `OTEL_LOGS_EXPORTER`, `OTEL_METRICS_EXPORTER`, `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_LOGS_EXPORT_INTERVAL`, `OTEL_METRICS_INCLUDE_REPOSITORY`, `COMPANY_COST_MANAGED` (marker). `settings.json` is rewritten atomically with owner-only permissions (mode 600; group/other bits are removed because the token lives there), after a one-time backup `settings.json.company-cost.bak` (kept until uninstall). If you already have different values for those keys it stops and lists them; `/company-cost:send-traces` adds `--force` only after you explicitly say yes (it is never taken from the skill argument, which must be exactly `on`, `off` or `status`), and `send-traces off` (or uninstall) restores the old ones. The CLI form is `company-cost send-traces on --force`. **Restart Claude Code** after `send-traces on` or `off`: the OTEL environment is read at startup.
 
-**send-traces off** removes exactly those keys and restores the previous values; URL and token stay in the sidecar, so you can switch it on again without running `setup`. **send-openspec on|off** only flips a flag (hooks read it on every event, no restart needed). Both require `setup` first; `send-traces on` without a configured URL/token fails with exit code 1 and points to `/company-cost:setup`.
+**send-traces off** first records the flag as off, then removes exactly those keys and restores the previous values (an original empty `env` object stays; `env` is deleted only if setup created it). If `settings.json` is invalid JSON or `env` is not an object, the flag is still off, the command exits 1 and tells you the OTEL keys remain: fix the file and run `send-traces off` again; URL and token stay in the sidecar, so you can switch it on again without running `setup`. **send-openspec on|off** only flips a flag (hooks read it on every event, no restart needed). Both require `setup` first; `send-traces on` without a configured URL/token fails with exit code 1 and points to `/company-cost:setup`.
 
 ### Registration exception when only openspec is on
 
@@ -188,7 +188,7 @@ The plugin never follows redirects. 401 is reported as a rejected token and paus
 | `409 unknown_project` on sync | the session `start` event did not arrive yet; it is queued and retried |
 | `Managed keys: MISSING` | re-run `/company-cost:send-traces`, then restart |
 | `token rejected` | get a new token, re-run `/company-cost:setup` |
-| send-traces lists conflicting keys | review them; re-run with `--force` only if you accept overriding |
+| send-traces lists conflicting keys | review them; run `/company-cost:send-traces` and answer yes to override (or `company-cost send-traces on --force`) |
 | `refusing plain http://` | use `https://` (or `--allow-insecure` for a trusted network) |
 | Queue keeps growing | check URL, network, `status` last error |
 | No cost events at the service | restart Claude Code; confirm the service accepts `<URL>/v1/otlp/v1/logs` |
