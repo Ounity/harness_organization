@@ -2,7 +2,7 @@
 """company-cost: Claude Code plugin helper (stdlib only, Python 3.9+).
 
 Commands:
-  company-cost setup [--url U] [--token T] [--token-stdin] [--force] [--allow-insecure]
+  company-cost setup [--url U] [--token T] [--token-stdin] [--agent NAME] [--force] [--allow-insecure]
   company-cost send-traces [on|off|status] [--force]      (default: on)
   company-cost send-openspec [on|off|status]             (default: on)
   company-cost uninstall
@@ -30,7 +30,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 # Constants (single block)
 # ---------------------------------------------------------------------------
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 PLUGIN_NAME = "company-cost"
 API_PREFIX = "/v1/ingest/plugin/"
 SERVER_CONTRACT = "/v1/ingest/plugin/* (v1)"
@@ -79,6 +79,9 @@ MAX_DELETE = 500
 
 EXCERPT_SOURCE_CHARS = 8000
 EXCERPT_MAX = 200
+AGENT_NAME_MAX = 64
+USER_REF_MAX = 200
+AGENT_ENV = "CLAUDE_PLUGIN_OPTION_AGENT_NAME"
 
 MANAGED_ENV_KEYS = (
     "CLAUDE_CODE_ENABLE_TELEMETRY",
@@ -411,6 +414,51 @@ def validate_token(token):
         return "token must be ASCII"
     if re.search(r"[\s,]", token):
         return "token must not contain whitespace or commas"
+    return None
+
+
+def validate_agent_name(name):
+    """Return (clean_name, error). Exactly one is None."""
+    if not isinstance(name, str):
+        return None, "agent name must be text"
+    n = name.strip()
+    if not n:
+        return None, "agent name is empty (use --agent \"\" to clear it)"
+    if len(n) > AGENT_NAME_MAX:
+        return None, "agent name is too long (max %d characters)" % AGENT_NAME_MAX
+    for ch in n:
+        cat = unicodedata.category(ch)
+        if cat[0] == "C":
+            return None, "agent name must not contain control or invisible characters"
+        if not (ch.isalnum() or ch in " ._-:/"):
+            return None, "agent name may only contain letters, digits, space and . _ - : /"
+    # Same redaction as prompts: anything it would alter looks like a secret (or is not NFKC-stable).
+    if redact_excerpt(_WS_RE.sub(" ", n)) != _WS_RE.sub(" ", n) or unicodedata.normalize("NFKC", n) != n:
+        return None, "agent name looks like a secret or contains unsupported characters; use a plain label"
+    if len(agent_user_ref(n)) > USER_REF_MAX:
+        return None, "agent name is too long"
+    return n, None
+
+
+def agent_user_ref(name):
+    return "agent:" + name
+
+
+def resolve_agent_name(side):
+    """Configured agent name or None. The sidecar wins; the plugin option env var is the fallback.
+
+    Invalid stored/env values are ignored (hooks must stay silent).
+    """
+    stored = side.get("agent_name") if isinstance(side, dict) else None
+    if isinstance(stored, str):
+        clean, err = validate_agent_name(stored)
+        if clean and not err:
+            return clean
+    env = os.environ.get(AGENT_ENV)
+    if isinstance(env, str) and env.strip():
+        clean, err = validate_agent_name(env)
+        if clean and not err:
+            return clean
     return None
 
 
@@ -1223,8 +1271,11 @@ def flush_queue(cfg, budget=QUEUE_FLUSH_BUDGET, flags=None):
 # ---------------------------------------------------------------------------
 # Hooks
 # ---------------------------------------------------------------------------
-def _session_payload(event, sid, ident, cwd, change, source):
-    """change/source None => the openspec feature is off: the change fields are omitted entirely."""
+def _session_payload(event, sid, ident, cwd, change, source, agent=None):
+    """change/source None => the openspec feature is off: the change fields are omitted entirely.
+
+    agent (validated name or None) is sent as `user_ref` = `agent:<name>`; omitted when unset.
+    """
     body = {
         "event": event,
         "session_id": sid,
@@ -1237,6 +1288,8 @@ def _session_payload(event, sid, ident, cwd, change, source):
     if change is not None:
         body["change_name"] = change
         body["change_source"] = source
+    if agent:
+        body["user_ref"] = agent_user_ref(agent)
     return body
 
 
@@ -1275,7 +1328,8 @@ def maybe_spawn_sync(ident, cwd, force):
 
 
 def run_hook(event, data):
-    flags = feature_flags(read_sidecar())
+    side = read_sidecar()
+    flags = feature_flags(side)
     costs, spec = flags["costs"], flags["openspec"]
     if not (costs or spec):
         return  # gate before any network, git or subprocess work
@@ -1286,6 +1340,7 @@ def run_hook(event, data):
     if not isinstance(sid, str) or not sid:
         return
     sid = sid[:200]
+    agent = resolve_agent_name(side)
     cwd = data.get("cwd") if isinstance(data.get("cwd"), str) and data.get("cwd") else os.getcwd()
     if event not in ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"):
         return
@@ -1310,7 +1365,7 @@ def run_hook(event, data):
                 if isinstance(inf, dict) and isinstance(inf.get("change"), str) \
                         and isinstance(inf.get("source"), str):
                     change, source = inf["change"], inf["source"]
-        send(cfg, "session", _session_payload("end", sid, ident, cwd, change, source), TIMEOUT_SESSION_END)
+        send(cfg, "session", _session_payload("end", sid, ident, cwd, change, source, agent), TIMEOUT_SESSION_END)
         return
     if event == "UserPromptSubmit" and not costs:
         return  # openspec-only sends nothing per prompt
@@ -1328,12 +1383,12 @@ def run_hook(event, data):
     if event == "SessionStart":
         # With openspec-only this single `start` is the project registration the server needs
         # before it accepts sync/plan (409 unknown_project otherwise).
-        send(cfg, "session", _session_payload("start", sid, ident, cwd, change, source), TIMEOUT_SESSION_START)
+        send(cfg, "session", _session_payload("start", sid, ident, cwd, change, source, agent), TIMEOUT_SESSION_START)
         flush_queue(cfg, flags=flags)
         if spec:
             maybe_spawn_sync(ident, cwd, force=True)
     elif event == "UserPromptSubmit":
-        send(cfg, "session", _session_payload("heartbeat", sid, ident, cwd, change, source), TIMEOUT_HEARTBEAT)
+        send(cfg, "session", _session_payload("heartbeat", sid, ident, cwd, change, source, agent), TIMEOUT_HEARTBEAT)
         excerpt = ""
         if os.environ.get("COMPANY_COST_NO_PROMPTS") != "1" and prompt:
             excerpt = redact_excerpt(prompt)
@@ -1347,7 +1402,7 @@ def run_hook(event, data):
     elif event == "Stop":
         outcome = None
         if costs:
-            outcome = send(cfg, "session", _session_payload("heartbeat", sid, ident, cwd, change, source),
+            outcome = send(cfg, "session", _session_payload("heartbeat", sid, ident, cwd, change, source, agent),
                            TIMEOUT_HEARTBEAT)
         if spec:
             maybe_spawn_sync(ident, cwd, force=False)
@@ -1580,12 +1635,16 @@ def enable_costs(side, force, err):
 
 
 @with_sidecar_lock
-def do_setup(url, token, force, allow_insecure, out, err):
+def do_setup(url, token, force, allow_insecure, out, err, agent=None):
+    """agent: None keeps the stored name, "" clears it, otherwise a validated name replaces it."""
     os.makedirs(config_dir(), exist_ok=True)
     side = read_sidecar()
     feats = setup_features(side)
     new = dict((k, side[k]) for k in ("managed_keys", "previous", "env_was_missing") if k in side)
     new.update({"url": url, "token": token, "allow_insecure": bool(allow_insecure), "features": feats})
+    keep = side.get("agent_name") if agent is None else agent
+    if isinstance(keep, str) and keep:
+        new["agent_name"] = keep
     if feats["costs"]:
         # costs already on: keep settings.json in sync with the (possibly new) URL/token
         rc = enable_costs(new, force, err)
@@ -1596,6 +1655,8 @@ def do_setup(url, token, force, allow_insecure, out, err):
     clear_auth_state()
     out.write("company-cost connection saved.\n")
     out.write("  URL:   %s\n  token: set (hidden)\n" % url)
+    if agent is not None:
+        out.write("  agent: %s\n" % (new.get("agent_name") or "not set"))
     if feats["costs"]:
         out.write("  Refreshed the managed keys in %s (traces is on). Restart Claude Code.\n" % settings_path())
     if not any(feats.values()):
@@ -1830,6 +1891,14 @@ def _fmt_ts(t):
         return "unknown"
 
 
+def _write_agent(side, out):
+    agent = resolve_agent_name(side)
+    if agent:
+        out.write("Agent name: %s (sent as user_ref `%s`)\n" % (agent, agent_user_ref(agent)))
+    else:
+        out.write("Agent name: not set (user_ref is not sent)\n")
+
+
 def do_status(out):
     out.write("company-cost %s\n" % VERSION)
     out.write("Server contract: %s\n" % SERVER_CONTRACT)
@@ -1840,6 +1909,7 @@ def do_status(out):
     out.write("URL: %s\n" % cfg["url"])
     out.write("Token: set (hidden)\n")
     side = read_sidecar()
+    _write_agent(side, out)
     flags = feature_flags(side)
     out.write("Features:\n")
     for name in FEATURES:
@@ -1893,7 +1963,9 @@ def do_doctor(out):
     except OSError:
         out.write("data dir writable: False\n")
     out.write("configured: %s\n" % ("yes" if load_config() else "no"))
-    flags = feature_flags(read_sidecar())
+    side = read_sidecar()
+    _write_agent(side, out)
+    flags = feature_flags(side)
     for name in FEATURES:
         out.write("%s: %s\n" % (FEATURE_LABEL[name], "enabled" if flags[name] else "disabled"))
     return 0
@@ -1909,6 +1981,7 @@ def cmd_setup(argv, out=None, err=None):
     ap.add_argument("--url")
     ap.add_argument("--token")
     ap.add_argument("--token-stdin", action="store_true")
+    ap.add_argument("--agent", default=None)
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--allow-insecure", action="store_true")
     args = ap.parse_args(argv)
@@ -1944,7 +2017,16 @@ def cmd_setup(argv, out=None, err=None):
     if problem:
         err.write("error: %s\n" % problem)
         return 1
-    return do_setup(clean, token, args.force, args.allow_insecure, out, err)
+    agent = None
+    if args.agent is not None:
+        if args.agent == "":
+            agent = ""
+        else:
+            agent, problem = validate_agent_name(args.agent)
+            if problem:
+                err.write("error: %s\n" % problem)
+                return 1
+    return do_setup(clean, token, args.force, args.allow_insecure, out, err, agent)
 
 
 def main(argv=None):

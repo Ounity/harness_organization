@@ -89,12 +89,16 @@ class Manifests(unittest.TestCase):
 
     def test_userconfig_keys(self):
         cfg = self.plugin["userConfig"]
-        self.assertEqual(set(cfg), {"RAG_URL", "RAG_TOKEN"})
+        self.assertEqual(set(cfg), {"RAG_URL", "RAG_TOKEN", "AGENT_NAME"})
         for name, opt in cfg.items():
             for key in ("type", "title", "description"):
                 self.assertIn(key, opt, name)
             self.assertLessEqual(set(opt), ALLOWED_USERCONFIG_KEYS, name)
         self.assertTrue(cfg["RAG_TOKEN"].get("sensitive"))
+        agent = cfg["AGENT_NAME"]
+        self.assertEqual(agent["type"], "string")
+        self.assertFalse(agent.get("required"))
+        self.assertFalse(agent.get("sensitive"))
 
     def test_marketplace(self):
         self.assertEqual(self.market["name"], "ounity-plugins")
@@ -195,6 +199,14 @@ class Skills(unittest.TestCase):
         text = self.read("setup")
         self.assertIn("--token-stdin", text)
         self.assertIsNone(re.search(r"--token(?![-\w])", text.replace("`--token`", "")))
+
+    def test_setup_agent_name_quoting_guidance(self):
+        text = self.read("setup")
+        self.assertIn("--agent='<NAME>'", text)  # single-quoted, attached with `=`
+        self.assertIn("A-Z a-z 0-9", text)  # allowed character set spelled out
+        self.assertIn("refuse", text.lower())
+        self.assertIn("optional", text.lower())
+        self.assertNotIn('--agent "', text)  # never double-quoted (shell expansion)
 
     def test_uninstall_order(self):
         text = self.read("uninstall")

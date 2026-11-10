@@ -22,7 +22,7 @@ class GateCase(HookCase):
 
     def set_features(self, name):
         with open(os.path.join(self.cfg, "settings.company-cost.json"), "w") as f:
-            json.dump({"features": COMBOS[name], "version": "0.2.0"}, f)
+            json.dump({"features": COMBOS[name], "version": "0.3.0"}, f)
 
     def recording_shim(self):
         out = os.path.join(self.tmp, "openspec.out")

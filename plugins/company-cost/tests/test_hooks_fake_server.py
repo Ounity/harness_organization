@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN_ROOT = os.path.dirname(HERE)
 SCRIPT = os.path.join(PLUGIN_ROOT, "bin", "company-cost")
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 SESSION_KEYS = {"event", "session_id", "project_key", "project_name", "branch", "repo_display",
                 "change_name", "change_source", "cwd_hash"}
 
@@ -101,7 +101,7 @@ class HookCase(unittest.TestCase):
         self.token = make_token()
         # env-only config sends nothing (opt-in required): default these tests to both features on
         with open(os.path.join(self.cfg, "settings.company-cost.json"), "w") as f:
-            json.dump({"features": {"costs": True, "openspec": True}, "version": "0.2.0"}, f)
+            json.dump({"features": {"costs": True, "openspec": True}, "version": "0.3.0"}, f)
         self.servers = []
         self.server = self.new_server()
         self.addCleanup(self.cleanup)
@@ -233,7 +233,7 @@ class TestHappyPath(HookCase):
                          ["start", "heartbeat", "heartbeat", "end"])
         start = reqs[0]["body"]
         self.assertEqual(set(start), SESSION_KEYS)
-        self.assertNotIn("user_ref", start)
+        self.assertNotIn("user_ref", start, "no agent configured: user_ref stays omitted")
         self.assertEqual(start["session_id"], "sess-1")
         self.assertEqual(start["project_key"], "git.example.com/team/app")
         self.assertEqual(start["project_name"], "app")

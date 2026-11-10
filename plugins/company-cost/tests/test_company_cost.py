@@ -33,7 +33,8 @@ def load_module():
 cc = load_module()
 
 ENV_KEYS = ("CLAUDE_CONFIG_DIR", "CLAUDE_PLUGIN_DATA", "CLAUDE_PLUGIN_OPTION_RAG_URL",
-            "CLAUDE_PLUGIN_OPTION_RAG_TOKEN", "COMPANY_COST_NO_PROMPTS", "COMPANY_COST_NO_SYNC")
+            "CLAUDE_PLUGIN_OPTION_RAG_TOKEN", "COMPANY_COST_NO_PROMPTS", "COMPANY_COST_NO_SYNC",
+            "CLAUDE_PLUGIN_OPTION_AGENT_NAME")
 
 
 def slurp(path):
@@ -118,7 +119,7 @@ def git(cwd, *args):
 # ---------------------------------------------------------------------------
 class TestIdentityAndVersion(unittest.TestCase):
     def test_version_constant(self):
-        self.assertEqual(cc.VERSION, "0.2.0")
+        self.assertEqual(cc.VERSION, "0.3.0")
 
     def test_version_consistency_with_plugin_json(self):
         pj = os.path.join(PLUGIN_ROOT, ".claude-plugin", "plugin.json")
