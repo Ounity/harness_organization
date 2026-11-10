@@ -1,0 +1,1727 @@
+#!/usr/bin/env python3
+"""company-cost: Claude Code plugin helper (stdlib only, Python 3.9+).
+
+Commands:
+  company-cost setup [--url U] [--token T] [--token-stdin] [--force] [--allow-insecure]
+  company-cost uninstall
+  company-cost status
+  company-cost doctor
+  company-cost hook <Event>        (called by Claude Code hooks; always silent, exit 0)
+  company-cost _sync --cwd DIR     (internal detached OpenSpec sync)
+"""
+import argparse
+import getpass
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+
+# ---------------------------------------------------------------------------
+# Constants (single block)
+# ---------------------------------------------------------------------------
+VERSION = "0.1.0"
+PLUGIN_NAME = "company-cost"
+API_PREFIX = "/v1/ingest/plugin/"
+SERVER_CONTRACT = "/v1/ingest/plugin/* (v1)"
+SENTINEL_KEY = "COMPANY_COST_MANAGED"
+DEFAULT_MARKETPLACE_HINT = "ounity-plugins"
+LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+TIMEOUT_SESSION_START = 3.0
+TIMEOUT_HEARTBEAT = 2.0
+TIMEOUT_PROMPT = 2.0
+TIMEOUT_SESSION_END = 1.5
+TIMEOUT_QUEUE_ITEM = 2.0
+QUEUE_FLUSH_BUDGET = 3.0
+TIMEOUT_OPENSPEC = 4.0
+TIMEOUT_PLAN = 10.0
+TIMEOUT_FILES = 20.0
+TIMEOUT_SNAPSHOT = 5.0
+TIMEOUT_GIT = 2.0
+# Wall-clock budget for the pre-send phase (git + openspec) of each hook, so the
+# HTTP sends always keep their share of the hooks.json timeout.
+DEADLINE_SESSION_START = 5.0
+DEADLINE_USER_PROMPT = 3.0
+DEADLINE_STOP = 2.0
+DEADLINE_SESSION_END = 1.0
+INFER_TTL = 60.0
+BACKOFF_AUTH = 900
+
+QUEUE_MAX_BYTES = 256000
+QUEUE_MAX_ITEMS = 500
+QUEUE_LOCK_STALE = 30.0
+QUEUE_LOCK_WAIT = 5.0
+QUEUE_CLAIM_STALE = 600.0
+BACKOFF_SECONDS = 60
+BACKOFF_MAX = 3600
+SYNC_INTERVAL = 120
+SYNC_LOCK_STALE = 600
+SESSIONS_MAX = 50
+STDIN_MAX = 1000000
+RESPONSE_MAX = 1000000
+
+MAX_MANIFEST = 5000
+MAX_FILE_BYTES = 1000000
+BATCH_FILES = 50
+BATCH_BYTES = 1500000
+MAX_DELETE = 500
+
+EXCERPT_SOURCE_CHARS = 8000
+EXCERPT_MAX = 200
+
+MANAGED_ENV_KEYS = (
+    "CLAUDE_CODE_ENABLE_TELEMETRY",
+    "OTEL_LOGS_EXPORTER",
+    "OTEL_METRICS_EXPORTER",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_LOGS_EXPORT_INTERVAL",
+    "OTEL_METRICS_INCLUDE_REPOSITORY",
+    SENTINEL_KEY,
+)
+
+# Redaction patterns (R-11): order matters, never remove or relax.
+_REDACTION_SPECS = (
+    (r"-----BEGIN [A-Z ]*KEY-----[\s\S]*?(?:-----END [A-Z ]*KEY-----|$)", 0),
+    (r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s/@:]+:[^\s/@]+@", 0),
+    (r"\bxox[abprs]-[A-Za-z0-9-]{10,}", 0),
+    (r"\bAIza[0-9A-Za-z_-]{20,}", 0),
+    (r"\bgithub_pat_[A-Za-z0-9_]{16,}", 0),
+    (r"\bsk-[A-Za-z0-9_-]{8,}", 0),
+    (r"\bgh[pousr]_[A-Za-z0-9]{16,}", 0),
+    (r"\b(?:AKIA|ASIA)[0-9A-Z]{12,}", 0),
+    (r"\bBearer\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE),
+    (r"\b(?:password|passwd|pwd|secret|api[_-]?key|token)s?\b\s*(?:is\b\s*[=:]?|[=:])\s*\S+", re.IGNORECASE),
+    (r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*", 0),
+    (r"[A-Za-z0-9+/_=]{32,}", 0),
+    # extra family (additions allowed)
+    (r"\bhro_[A-Za-z0-9_-]{8,}", 0),
+    (r"\"[A-Za-z0-9_-]*(?:password|passwd|pwd|secret|api[_-]?key|token)s?\"\s*:\s*\"(?:[^\"\\]|\\.)*\"", re.IGNORECASE),
+    (r"\bBasic\s+[A-Za-z0-9+/=]{8,}", re.IGNORECASE),
+    (r"(?<![A-Za-z])sk-[A-Za-z0-9_-]{8,}", 0),
+    (r"(?<![A-Za-z])gh[pousr]_[A-Za-z0-9]{16,}", 0),
+    (r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{12,}", 0),
+)
+# Keyword inside an identifier (DB_PASSWORD, GITHUB_TOKEN, aws.secret_access_key). The lookahead
+# makes the scan linear: it only starts at the beginning of an identifier run.
+_KEY_WORDS = r"(?:password|passwd|pwd|secret|api[_-]?key|apikey|token|access[_-]?key)"
+_IDENT_KEY = r"(?<![A-Za-z0-9_.-])(?=[A-Za-z0-9_.-]*?" + _KEY_WORDS + r")[A-Za-z0-9_.-]+"
+# appended AFTER the original patterns (those use \b, and "_" is a word char)
+_REDACTION_SPECS = _REDACTION_SPECS + (
+    (_IDENT_KEY + r"[\"']?\s*[=:]\s*\S+", re.IGNORECASE),
+)
+# Quoted values must run BEFORE the originals: the original key=value pattern would eat only the
+# first word of 'my secret phrase' and leave the rest behind. Redacts to the closing quote or the end.
+_QUOTED_SPECS = (
+    (_IDENT_KEY + r"[\"']?\s*[=:]\s*(?:'[^']*(?:'|$)|\"(?:[^\"\\]|\\.)*(?:\"|$))", re.IGNORECASE),
+)
+REDACTION_PATTERNS = tuple(re.compile(p, f) for p, f in _REDACTION_SPECS)
+_URL_CREDS_PATTERN = REDACTION_PATTERNS[1]
+_QUOTED_PATTERNS = tuple(re.compile(p, f) for p, f in _QUOTED_SPECS)
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
+_WS_RE = re.compile(r"\s+")
+_DEADLINE = [None]  # monotonic deadline for subprocess work inside a hook
+
+
+# ---------------------------------------------------------------------------
+# Paths, files, locks
+# ---------------------------------------------------------------------------
+def _is_windows():
+    return os.name == "nt"
+
+
+def config_dir():
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+
+
+_DATA_OVERRIDE = [None]
+
+
+def data_dir():
+    return (os.environ.get("CLAUDE_PLUGIN_DATA") or _DATA_OVERRIDE[0]
+            or os.path.join(config_dir(), "plugins", "data", PLUGIN_NAME))
+
+
+def _plugins_data_root():
+    return os.path.join(config_dir(), "plugins", "data")
+
+
+def discover_data_dir():
+    """Skills run without CLAUDE_PLUGIN_DATA: find the dir the hooks really use.
+
+    Newest company-cost* dir under <cfg>/plugins/data holding state.json or queue.jsonl.
+    """
+    best, best_t = None, -1.0
+    root = _plugins_data_root()
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return None
+    for fn in names:
+        if not re.match(r"^company-cost(-[A-Za-z0-9._-]+)?$", fn):
+            continue
+        d = os.path.join(root, fn)
+        if os.path.islink(d) or not os.path.isdir(d):
+            continue
+        for marker in ("state.json", "queue.jsonl"):
+            try:
+                t = os.stat(os.path.join(d, marker)).st_mtime
+            except OSError:
+                continue
+            if t > best_t:
+                best, best_t = d, t
+    return best
+
+
+def use_discovered_data_dir():
+    if not os.environ.get("CLAUDE_PLUGIN_DATA"):
+        _DATA_OVERRIDE[0] = discover_data_dir()
+
+
+def settings_path():
+    return os.path.join(config_dir(), "settings.json")
+
+
+def sidecar_path():
+    return os.path.join(config_dir(), "settings.company-cost.json")
+
+
+def backup_path():
+    return os.path.join(config_dir(), "settings.json.company-cost.bak")
+
+
+def ensure_data_dir():
+    os.makedirs(data_dir(), mode=0o700, exist_ok=True)
+
+
+def atomic_write(path, text, mode=0o600):
+    tmp = "%s.tmp.%d.%s" % (path, os.getpid(), os.urandom(3).hex())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_json_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+class FileLock(object):
+    """Cross-platform advisory lock based on O_EXCL file creation with stale takeover.
+
+    The lock file holds "<pid>.<random>"; only the owner removes it. Long holders call refresh()
+    to bump the mtime. A lock is taken over only when its mtime is older than `stale` AND either
+    the holder pid is dead or the file is unchanged across a short re-check; the takeover itself
+    is an atomic rename to a unique name, so only one contender can win.
+    """
+
+    RECHECK = 0.05
+
+    def __init__(self, path, stale=30.0, wait=2.0):
+        self.path = path
+        self.stale = stale
+        self.wait = wait
+        self.held = False
+        self.token = "%d.%s" % (os.getpid(), os.urandom(6).hex())
+
+    def _snapshot(self):
+        try:
+            st = os.stat(self.path)
+            with open(self.path, "r", encoding="ascii") as f:
+                owner = f.read(128)
+        except (OSError, UnicodeDecodeError):
+            return None
+        return (st.st_mtime_ns, st.st_ino, owner)
+
+    @staticmethod
+    def _pid_dead(owner):
+        try:
+            pid = int(owner.split(".", 1)[0])
+            if pid <= 0:
+                return False
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except (ValueError, OSError):
+            return False
+        return False
+
+    def _take_over_stale(self):
+        first = self._snapshot()
+        if first is None or time.time() - first[0] / 1e9 <= self.stale:
+            return
+        if not self._pid_dead(first[2]):
+            time.sleep(self.RECHECK)
+            if self._snapshot() != first:
+                return  # the holder is alive and refreshed (or it changed hands)
+        grave = "%s.stale.%s" % (self.path, os.urandom(4).hex())
+        try:
+            os.rename(self.path, grave)
+        except OSError:
+            return  # someone else won, or it vanished
+        try:
+            with open(grave, "r", encoding="ascii") as f:
+                grabbed = f.read(128)
+            if grabbed != first[2]:
+                # we moved a different (fresh) lock: put it back if we can
+                try:
+                    os.link(grave, self.path)
+                except OSError:
+                    pass
+        except (OSError, UnicodeDecodeError):
+            pass
+        try:
+            os.unlink(grave)
+        except OSError:
+            pass
+
+    def acquire(self):
+        deadline = time.monotonic() + self.wait
+        while True:
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                try:
+                    os.write(fd, self.token.encode("ascii"))
+                finally:
+                    os.close(fd)
+                self.held = True
+                return True
+            except FileExistsError:
+                try:
+                    age = time.time() - os.stat(self.path).st_mtime
+                except OSError:
+                    continue
+                if age > self.stale:
+                    self._take_over_stale()
+                    continue
+            except OSError:
+                return False
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.005)
+
+    def refresh(self):
+        """Keep a long-held lock from looking stale."""
+        if self.held:
+            try:
+                os.utime(self.path, None)
+            except OSError:
+                pass
+
+    def release(self):
+        if self.held:
+            self.held = False
+            try:
+                with open(self.path, "r", encoding="ascii") as f:
+                    owner = f.read(128)
+                if owner == self.token:
+                    os.unlink(self.path)
+            except (OSError, UnicodeDecodeError):
+                pass
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Redaction
+# ---------------------------------------------------------------------------
+def redact_excerpt(text):
+    """Return a safe excerpt (<=200 chars) of text with secrets replaced."""
+    if not isinstance(text, str):
+        return ""
+    s = unicodedata.normalize("NFKC", text[:EXCERPT_SOURCE_CHARS])
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Cf")
+    s = _CONTROL_RE.sub(" ", s)
+    # Redact the whole (larger) window first and cut to the final excerpt afterwards, so a cut can
+    # never leave a fragment of a secret.
+    for pat in _QUOTED_PATTERNS:
+        s = pat.sub("[REDACTED]", s)
+    has_scheme = "://" in s
+    for pat in REDACTION_PATTERNS:
+        if pat is _URL_CREDS_PATTERN and not has_scheme:
+            continue  # cannot match without "://"; skipping avoids its quadratic scan on long runs
+        s = pat.sub("[REDACTED]", s)
+    s = _WS_RE.sub(" ", s).strip()
+    return s[:EXCERPT_MAX]
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+def validate_url(url, allow_insecure=False):
+    """Return (clean_url, error). Exactly one is None."""
+    if not isinstance(url, str):
+        return None, "URL must be text"
+    u = url.strip()
+    if not re.match(r"^https?://[^\s/]+", u) or re.search(r"\s", u):
+        return None, "URL must look like https://host[:port][/path] (no spaces)"
+    u = u.rstrip("/")
+    try:
+        parts = urllib.parse.urlsplit(u)
+        host = parts.hostname
+        parts.port  # noqa: B018 - validates the port
+    except ValueError:
+        return None, "URL is malformed"
+    if not host:
+        return None, "URL has no host"
+    if "@" in parts.netloc:
+        return None, "URL must not contain credentials"
+    if parts.query or parts.fragment:
+        return None, "URL must not contain a query or fragment"
+    if parts.scheme == "http" and host.lower() not in LOCAL_HOSTS and not allow_insecure:
+        return None, "refusing plain http:// to a non-local host (use https, or --allow-insecure)"
+    return u, None
+
+
+def validate_token(token):
+    if not isinstance(token, str) or not token:
+        return "token is empty"
+    if not token.isascii():
+        return "token must be ASCII"
+    if re.search(r"[\s,]", token):
+        return "token must not contain whitespace or commas"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+def read_sidecar():
+    return read_json_file(sidecar_path())
+
+
+def load_config():
+    """Return {'url','token'} or None. Sources: env, then sidecar."""
+    url = os.environ.get("CLAUDE_PLUGIN_OPTION_RAG_URL") or ""
+    token = os.environ.get("CLAUDE_PLUGIN_OPTION_RAG_TOKEN") or ""
+    sc = None
+    if not (url and token):
+        sc = read_sidecar()
+        url = url or (sc.get("url") if isinstance(sc.get("url"), str) else "")
+        token = token or (sc.get("token") if isinstance(sc.get("token"), str) else "")
+    if not url or not token:
+        return None
+    if sc is None:
+        sc = read_sidecar()
+    clean, err = validate_url(url, allow_insecure=bool(sc.get("allow_insecure")))
+    if err or validate_token(token):
+        return None
+    return {"url": clean, "token": token}
+
+
+# ---------------------------------------------------------------------------
+# State and sessions
+# ---------------------------------------------------------------------------
+def _state_path():
+    return os.path.join(data_dir(), "state.json")
+
+
+def load_state():
+    return read_json_file(_state_path())
+
+
+def mutate_state(fn):
+    try:
+        ensure_data_dir()
+        with FileLock(os.path.join(data_dir(), "state.lock"), stale=QUEUE_LOCK_STALE, wait=1.0) as lk:
+            if not lk.held:
+                return  # never read-modify-write without the lock
+            state = load_state()
+            fn(state)
+            atomic_write(_state_path(), json.dumps(state, sort_keys=True))
+    except Exception:
+        pass
+
+
+def in_backoff(state):
+    try:
+        return float(state.get("backoff_until") or 0) > time.time()
+    except (TypeError, ValueError):
+        return False
+
+
+def _sessions_path():
+    return os.path.join(data_dir(), "sessions.json")
+
+
+def session_meta(sid):
+    entry = read_json_file(_sessions_path()).get(sid)
+    return entry if isinstance(entry, dict) else {}
+
+
+def session_meta_update(sid, **fields):
+    try:
+        ensure_data_dir()
+        with FileLock(os.path.join(data_dir(), "sessions.lock"), stale=QUEUE_LOCK_STALE, wait=1.0) as lk:
+            if not lk.held:
+                return
+            cache = read_json_file(_sessions_path())
+            entry = cache.get(sid) if isinstance(cache.get(sid), dict) else {}
+            entry.update(fields)
+            entry["ts"] = time.time()
+            cache[sid] = entry
+            if len(cache) > SESSIONS_MAX:
+                ordered = sorted(cache.items(), key=lambda kv: (kv[1].get("ts", 0) if isinstance(kv[1], dict) else 0))
+                cache = dict(ordered[len(cache) - SESSIONS_MAX:])
+            atomic_write(_sessions_path(), json.dumps(cache, sort_keys=True))
+    except Exception:
+        pass
+
+
+def session_cache_set(sid, change):
+    session_meta_update(sid, change=change)
+
+
+# ---------------------------------------------------------------------------
+# Subprocess helpers (git / openspec only, argv lists, no shell)
+# ---------------------------------------------------------------------------
+def _run(argv, cwd=None, timeout=TIMEOUT_GIT):
+    dl = _DEADLINE[0]
+    if dl is not None:
+        remaining = dl - time.monotonic()
+        if remaining <= 0.05:
+            return None
+        timeout = min(timeout, remaining)
+    try:
+        p = subprocess.run(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=timeout, shell=False)
+        if p.returncode != 0:
+            return None
+        return p.stdout.decode("utf-8", "replace")
+    except Exception:
+        return None
+
+
+def _git(args, cwd):
+    out = _run(["git"] + list(args), cwd=cwd)
+    return out.strip() if out is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Project identity
+# ---------------------------------------------------------------------------
+def normalize_remote(url):
+    """Normalize a git remote URL to host/owner/repo, or None."""
+    if not isinstance(url, str):
+        return None
+    u = url.strip()
+    if not u:
+        return None
+    m = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://(.*)$", u)
+    if m:
+        rest = m.group(1)
+        authority, _, path = rest.partition("/")
+        authority = authority.rpartition("@")[2]
+        if authority.startswith("["):
+            host = authority.split("]")[0] + "]"
+        else:
+            host = re.sub(r":\d*$", "", authority)
+    else:
+        m = re.match(r"^(?:[^@/\s]+@)?([^:/\s]+):(?!//)(.+)$", u)
+        if not m:
+            return None
+        host, path = m.group(1), m.group(2)
+    host = host.lower()
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    path = path.strip("/")
+    if not host or not path:
+        return None
+    return host + "/" + path
+
+
+def project_identity(cwd):
+    """Return dict key, name, repo_display, branch, toplevel."""
+    top = _git(["rev-parse", "--show-toplevel"], cwd) or ""
+    ident = {"key": "", "name": "", "repo_display": "", "branch": "", "toplevel": top}
+    folder = os.path.basename((top or cwd).rstrip("/\\")) or "unknown"
+    norm = None
+    if top:
+        remotes = (_git(["remote"], cwd) or "").split()
+        chosen = "origin" if "origin" in remotes else (remotes[0] if remotes else "")
+        if chosen:
+            norm = normalize_remote(_git(["remote", "get-url", chosen], cwd) or "")
+    if norm:
+        ident["key"] = norm
+        ident["name"] = norm.rsplit("/", 1)[-1]
+        ident["repo_display"] = norm
+    else:
+        root = ""
+        if top:
+            roots = sorted((_git(["rev-list", "--max-parents=0", "HEAD"], cwd) or "").split())
+            root = roots[0] if roots else ""
+        if root:
+            ident["key"] = "git-root-" + root[:16]
+        else:
+            ident["key"] = folder
+        ident["name"] = folder
+        ident["repo_display"] = folder
+    if top:
+        branch = _git(["branch", "--show-current"], cwd) or ""
+        if not branch:
+            sha = _git(["rev-parse", "--short=7", "HEAD"], cwd) or ""
+            branch = "detached-" + sha[:7] if sha else ""
+        ident["branch"] = branch
+    return ident
+
+
+def cwd_hash(cwd):
+    return hashlib.sha256(cwd.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# OpenSpec
+# ---------------------------------------------------------------------------
+def parse_openspec_list(text):
+    """Tolerant parse of `openspec list --json`; garbage yields an empty result."""
+    result = {"root": None, "changes": []}
+    try:
+        data = json.loads(text)
+    except Exception:
+        return result
+    items = None
+    if isinstance(data, dict):
+        items = data.get("changes")
+        root = data.get("root")
+        if isinstance(root, dict) and isinstance(root.get("path"), str):
+            result["root"] = root["path"]
+        elif isinstance(root, str):
+            result["root"] = root
+    elif isinstance(data, list):
+        items = data
+    if not isinstance(items, list):
+        return result
+
+    def _int(v):
+        return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        name = it.get("name")
+        if not isinstance(name, str) or not name or len(name) > 200:
+            continue
+        status = it.get("status")
+        lm = it.get("lastModified")
+        result["changes"].append({
+            "name": name,
+            "completedTasks": _int(it.get("completedTasks")),
+            "totalTasks": _int(it.get("totalTasks")),
+            "status": status if isinstance(status, str) else "",
+            "lastModified": lm if isinstance(lm, str) else "",
+        })
+    return result
+
+
+def openspec_list(cwd):
+    out = _run(["openspec", "list", "--json"], cwd=cwd, timeout=TIMEOUT_OPENSPEC)
+    return parse_openspec_list(out) if out is not None else {"root": None, "changes": []}
+
+
+def _looks_like_root(path):
+    return os.path.isdir(os.path.join(path, "changes")) or os.path.isdir(os.path.join(path, "specs"))
+
+
+def _within(real, base):
+    return real == base or real.startswith(base.rstrip(os.sep) + os.sep)
+
+
+def resolve_openspec_root(cwd, git_top, cli_root=None):
+    """Return (root_or_None, skipped_count). Refuses symlinked / escaping roots."""
+    skipped = 0
+    try:
+        limit = os.path.realpath(git_top or cwd)
+    except Exception:
+        return None, 0
+    cands = []
+    if cli_root and os.path.isdir(cli_root):
+        cands.append(cli_root)
+        cands.extend(os.path.join(cli_root, n) for n in ("openspec", "specs"))
+    for base in (git_top, cwd):
+        if base and os.path.isdir(base):
+            cands.extend(os.path.join(base, n) for n in ("openspec", "specs"))
+    seen = set()
+    for c in cands:
+        if c in seen or not os.path.isdir(c) or not _looks_like_root(c):
+            continue
+        seen.add(c)
+        if os.path.islink(c):
+            skipped += 1
+            continue
+        if not _within(os.path.realpath(c), limit):
+            skipped += 1
+            continue
+        return c, skipped
+    return None, skipped
+
+
+def collect_files_ex(root):
+    """Collect *.md files under root.
+
+    Returns (files, skipped, skipped_paths, truncated): skipped_paths are the relative paths that
+    exist locally but were not collected; truncated is True when MAX_MANIFEST cut the manifest.
+    """
+    skipped_paths = []
+    truncated = False
+    rels = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        rel_dir = os.path.relpath(dirpath, root)
+        if rel_dir == "changes" and "archive" in dirnames:
+            dirnames.remove("archive")
+        dirnames.sort()
+        for fn in filenames:
+            if fn.endswith(".md"):
+                rel = os.path.normpath(os.path.join(rel_dir, fn))
+                rels.append(rel.replace(os.sep, "/"))
+    rels.sort()
+    files = []
+    for rel in rels:
+        full = os.path.join(root, *rel.split("/"))
+        try:
+            st = os.lstat(full)
+            if not (os.path.isfile(full) and not os.path.islink(full)) or st.st_size > MAX_FILE_BYTES:
+                skipped_paths.append(rel)
+                continue
+            if len(files) >= MAX_MANIFEST:
+                skipped_paths.append(rel)
+                truncated = True
+                continue
+            with open(full, "rb") as f:
+                raw = f.read(MAX_FILE_BYTES + 1)
+            if len(raw) > MAX_FILE_BYTES:
+                skipped_paths.append(rel)
+                continue
+            text = raw.decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            skipped_paths.append(rel)
+            continue
+        files.append({"path": rel, "content": text,
+                      "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()})
+    return files, len(skipped_paths), skipped_paths, truncated
+
+
+def collect_files(root):
+    """Collect *.md files under root. Returns (files, skipped)."""
+    files, skipped, _, _ = collect_files_ex(root)
+    return files, skipped
+
+
+def safe_deletes(root, delete, skipped_paths, truncated):
+    """Filter server `delete` entries so local-but-unsynced files are never wiped remotely."""
+    if truncated:
+        return []  # the server saw a partial manifest: it cannot tell what is really gone
+    skip = set(skipped_paths)
+    out = []
+    for p in delete:
+        parts = p.split("/")
+        if p in skip or not p or p.startswith("/") or ".." in parts or "\x00" in p:
+            continue
+        if os.path.lexists(os.path.join(root, *parts)):
+            continue  # exists locally (skipped, symlink, unreadable...): not ours to delete
+        out.append(p)
+    return out
+
+
+def plan_batches(files, delete):
+    """Split files [{path,content}] into upload batches; delete only in the first."""
+    batches = []
+    cur, cur_bytes = [], 0
+    for f in files:
+        size = len(f["content"].encode("utf-8"))
+        if cur and (len(cur) >= BATCH_FILES or cur_bytes + size > BATCH_BYTES):
+            batches.append({"files": cur, "delete": []})
+            cur, cur_bytes = [], 0
+        cur.append({"path": f["path"], "content": f["content"]})
+        cur_bytes += size
+    if cur:
+        batches.append({"files": cur, "delete": []})
+    delete = list(delete)[:MAX_DELETE]
+    if delete:
+        if not batches:
+            batches.append({"files": [], "delete": []})
+        batches[0]["delete"] = delete
+    return batches
+
+
+# ---------------------------------------------------------------------------
+# Change inference
+# ---------------------------------------------------------------------------
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
+# Change names are not run through the generic redactor (it would reject long kebab-case names);
+# only the specific high-signal token families are refused.
+_NAME_SECRET_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}"
+    r"|(?:AKIA|ASIA)[0-9A-Z]{12,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|hro_[A-Za-z0-9_-]{8,}"
+    r"|xox[abprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{20,})")
+_OPENSPEC_SUBCMDS = frozenset((
+    "apply", "archive", "propose", "proposal", "new", "explore", "continue", "ff", "verify",
+    "sync", "onboard", "change", "list", "show", "validate", "bulk-archive", "init", "update",
+))
+
+
+def parse_command(prompt):
+    """Extract change name from `/opsx:<cmd> <name>` or `/openspec ... <name>`."""
+    if not isinstance(prompt, str):
+        return ""
+    first = prompt.lstrip()[:500].split("\n", 1)[0]
+    m = re.match(r"^/(opsx:[\w-]+|openspec[\w:-]*)(?:\s+(.*))?$", first)
+    if not m:
+        return ""
+    is_openspec = m.group(1).startswith("openspec")
+    for tok in (m.group(2) or "").split():
+        if tok.startswith("-"):
+            continue
+        if is_openspec and tok.lower() in _OPENSPEC_SUBCMDS:
+            continue
+        if _NAME_RE.match(tok) and not _NAME_SECRET_RE.search(tok):
+            return tok
+        return ""
+    return ""
+
+
+_IDENT_KEYS = ("key", "name", "repo_display", "branch", "toplevel")
+
+
+def _clean_ident(ident):
+    return dict((k, ident.get(k) if isinstance(ident.get(k), str) else "") for k in _IDENT_KEYS)
+
+
+def _fresh_infer(inf, branch):
+    try:
+        return (isinstance(inf, dict) and inf.get("branch") == branch
+                and isinstance(inf.get("change"), str) and isinstance(inf.get("source"), str)
+                and 0 <= time.time() - float(inf.get("ts", 0)) < INFER_TTL)
+    except (TypeError, ValueError):
+        return False
+
+
+def resolve_change(sid, cwd, ident, prompt=None):
+    """Return (change_name, change_source). Inference is cached per session for INFER_TTL."""
+    name = parse_command(prompt) if prompt else ""
+    if name:
+        session_cache_set(sid, name)
+        return name, "command"
+    meta = session_meta(sid)
+    cached = meta.get("change")
+    if isinstance(cached, str) and cached:
+        return cached, "command"
+    branch = ident.get("branch") or ""
+    inf = meta.get("infer")
+    if _fresh_infer(inf, branch):
+        return inf["change"], inf["source"]
+    change, source = _infer_change(cwd, ident, branch)
+    session_meta_update(sid, infer={"change": change, "source": source, "branch": branch, "ts": time.time()},
+                        ident=_clean_ident(ident))
+    return change, source
+
+
+def _infer_change(cwd, ident, branch):
+    ol = openspec_list(cwd)
+    root, _ = resolve_openspec_root(cwd, ident.get("toplevel") or "", ol.get("root"))
+    if root and branch and "/" not in branch and branch not in (".", "..") \
+            and os.path.isdir(os.path.join(root, "changes", branch)):
+        return branch, "branch"
+    dated = [c for c in ol["changes"] if c["lastModified"]]
+    if dated:
+        return max(dated, key=lambda c: c["lastModified"])["name"], "recent"
+    return "", ""
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects, so the bearer token never leaves the origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class Resp(object):
+    def __init__(self, status=0, retry_after=None, body=None):
+        self.status = status
+        self.retry_after = retry_after
+        self.body = body
+
+
+def http_post(cfg, suffix, payload, timeout):
+    url = cfg["url"] + API_PREFIX + suffix
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Authorization", "Bearer " + cfg["token"])
+    req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", "%s/%s" % (PLUGIN_NAME, VERSION))
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            status = resp.status
+            raw = resp.read(RESPONSE_MAX)
+        body = None
+        if 200 <= status < 300:
+            try:
+                body = json.loads(raw.decode("utf-8", "replace"))
+            except Exception:
+                body = None
+        return Resp(status, None, body)
+    except urllib.error.HTTPError as e:
+        retry = None
+        try:
+            ra = e.headers.get("Retry-After") if e.headers else None
+            if ra and re.match(r"^\d+$", ra.strip()):
+                retry = int(ra.strip())
+        except Exception:
+            retry = None
+        try:
+            e.close()
+        except Exception:
+            pass
+        return Resp(e.code, retry, None)
+    except Exception:
+        return Resp(0)
+
+
+def deliver(cfg, suffix, payload, timeout):
+    """One network attempt with outcome bookkeeping.
+
+    Returns (outcome, resp) with outcome in ok | retry | auth | drop.
+    """
+    r = http_post(cfg, suffix, payload, timeout)
+    s = r.status
+    now = time.time()
+    if 200 <= s < 300:
+        def f(st):
+            st["last_ok"] = now
+            st["last_error"] = None
+            st["backoff_until"] = 0
+        mutate_state(f)
+        return "ok", r
+    if s == 401:
+        def a401(st):
+            st["last_error"] = "http_401"
+            st["backoff_until"] = now + BACKOFF_AUTH
+        mutate_state(a401)
+        return "auth", r
+    if s == 429 or s == 0 or s >= 500:
+        wait = BACKOFF_SECONDS
+        if s == 429 and r.retry_after is not None:
+            wait = max(1, min(r.retry_after, BACKOFF_MAX))
+        err = "network" if s == 0 else "http_%d" % s
+
+        def g(st):
+            st["last_error"] = err
+            st["backoff_until"] = now + wait
+        mutate_state(g)
+        return "retry", r
+    err = "http_%d" % s
+    mutate_state(lambda st: st.__setitem__("last_error", err))
+    return "drop", r
+
+
+def send(cfg, suffix, payload, timeout, queueable=True):
+    """Deliver or queue. Returns outcome string (ok, retry, auth, drop, backoff).
+
+    Heartbeats are never queued: they carry no information a later start/end/prompt lacks, and
+    queued ones would evict the items that matter.
+    """
+    if suffix == "session" and isinstance(payload, dict) and payload.get("event") == "heartbeat":
+        queueable = False
+    if in_backoff(load_state()):
+        if queueable:
+            queue_append(suffix, payload)
+        return "backoff"
+    outcome, _ = deliver(cfg, suffix, payload, timeout)
+    if outcome == "retry" and queueable:
+        queue_append(suffix, payload)
+    return outcome
+
+
+# ---------------------------------------------------------------------------
+# Queue
+# ---------------------------------------------------------------------------
+_QUEUE_SUFFIXES = ("session", "prompt", "snapshot")
+
+
+def _queue_path():
+    return os.path.join(data_dir(), "queue.jsonl")
+
+
+def _queue_lock():
+    return FileLock(os.path.join(data_dir(), "queue.lock"), stale=QUEUE_LOCK_STALE, wait=QUEUE_LOCK_WAIT)
+
+
+def _read_lines(path):
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return []
+    lines = []
+    for ln in raw.split(b"\n"):
+        if ln.strip():
+            lines.append(ln + b"\n")
+    return lines
+
+
+def _trim(lines):
+    total = sum(len(x) for x in lines)
+    start = 0
+    n = len(lines)
+    while (n - start) > QUEUE_MAX_ITEMS or total > QUEUE_MAX_BYTES:
+        total -= len(lines[start])
+        start += 1
+    return lines[start:]
+
+
+def _write_lines(path, lines):
+    if not lines:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return
+    atomic_write(path, b"".join(lines).decode("utf-8"))
+
+
+def queue_append(suffix, payload):
+    try:
+        ensure_data_dir()
+        line = (json.dumps({"path": suffix, "payload": payload, "ts": time.time()},
+                           separators=(",", ":")) + "\n").encode("utf-8")
+        if len(line) > QUEUE_MAX_BYTES:
+            return False
+        with _queue_lock() as lk:
+            if not lk.held:
+                return False
+            path = _queue_path()
+            lines = _read_lines(path)
+            lines.append(line)
+            trimmed = _trim(lines)
+            if len(trimmed) != len(lines):
+                _write_lines(path, trimmed)
+            else:
+                fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+                try:
+                    os.write(fd, line)
+                finally:
+                    os.close(fd)
+        return True
+    except Exception:
+        return False
+
+
+def _claim_files():
+    d = data_dir()
+    try:
+        return [os.path.join(d, fn) for fn in sorted(os.listdir(d)) if fn.startswith("queue.claim.")]
+    except OSError:
+        return []
+
+
+def queue_size():
+    return len(_read_lines(_queue_path())) + sum(len(_read_lines(p)) for p in _claim_files())
+
+
+def _queue_claim():
+    """Atomically take ownership of the queue. Returns (claim_path, lines)."""
+    d = data_dir()
+    with _queue_lock() as lk:
+        if not lk.held:
+            return None, []
+        lines = []
+        try:
+            for fn in sorted(os.listdir(d)):
+                if fn.startswith("queue.claim."):
+                    p = os.path.join(d, fn)
+                    if time.time() - os.stat(p).st_mtime > QUEUE_CLAIM_STALE:
+                        lines.extend(_read_lines(p))
+                        os.unlink(p)
+        except OSError:
+            pass
+        claim = os.path.join(d, "queue.claim.%d.%s" % (os.getpid(), os.urandom(3).hex()))
+        try:
+            os.replace(_queue_path(), claim)
+        except OSError:
+            if not lines:
+                return None, []
+            return None, lines
+        return claim, lines + _read_lines(claim)
+
+
+def _queue_restore(claim, unsent):
+    with _queue_lock() as lk:
+        if not lk.held:
+            return False  # keep the claim on disk: it is adopted later as an orphan
+        if unsent:
+            current = _read_lines(_queue_path())
+            _write_lines(_queue_path(), _trim(unsent + current))
+        if claim:
+            try:
+                os.unlink(claim)
+            except OSError:
+                pass
+        return lk.held
+
+
+def flush_queue(cfg, budget=QUEUE_FLUSH_BUDGET):
+    try:
+        if in_backoff(load_state()) or not (os.path.exists(_queue_path()) or _claim_files()):
+            return
+        deadline = time.monotonic() + budget
+        claim, lines = _queue_claim()
+        if claim is None and not lines:
+            return
+        unsent = []
+        stopped = False
+        for ln in lines:
+            if stopped:
+                unsent.append(ln)
+                continue
+            try:
+                item = json.loads(ln.decode("utf-8"))
+                suffix, payload = item["path"], item["payload"]
+                if suffix not in _QUEUE_SUFFIXES or not isinstance(payload, dict):
+                    continue
+            except Exception:
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining < 0.2:
+                stopped = True
+                unsent.append(ln)
+                continue
+            outcome, _ = deliver(cfg, suffix, payload, min(TIMEOUT_QUEUE_ITEM, remaining))
+            if outcome in ("auth", "retry"):
+                stopped = True
+                unsent.append(ln)
+        _queue_restore(claim, unsent)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Hooks
+# ---------------------------------------------------------------------------
+def _session_payload(event, sid, ident, cwd, change, source):
+    return {
+        "event": event,
+        "session_id": sid,
+        "project_key": ident["key"],
+        "project_name": ident["name"],
+        "branch": ident["branch"],
+        "repo_display": ident["repo_display"],
+        "change_name": change,
+        "change_source": source,
+        "cwd_hash": cwd_hash(cwd),
+    }
+
+
+def _sync_key(project_key, branch):
+    return hashlib.sha256((project_key + "\0" + branch).encode("utf-8")).hexdigest()[:16]
+
+
+def spawn_sync(cwd):
+    argv = [sys.executable, os.path.realpath(__file__), "_sync", "--cwd", cwd]
+    kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+          "stderr": subprocess.DEVNULL, "close_fds": True}
+    if os.name == "nt":
+        kw["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0x8) | \
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
+    else:
+        kw["start_new_session"] = True
+    subprocess.Popen(argv, **kw)
+
+
+def maybe_spawn_sync(ident, cwd, force):
+    if os.environ.get("COMPANY_COST_NO_SYNC") == "1" or not ident["branch"]:
+        return False
+    key = ident["key"] + "|" + ident["branch"]
+    if not force:
+        last = (load_state().get("sync") or {}).get(key)
+        if isinstance(last, (int, float)) and time.time() - last < SYNC_INTERVAL:
+            return False
+
+    def f(st):
+        if not isinstance(st.get("sync"), dict):
+            st["sync"] = {}
+        st["sync"][key] = time.time()
+    mutate_state(f)
+    spawn_sync(cwd)
+    return True
+
+
+def run_hook(event, data):
+    cfg = load_config()
+    if not cfg or not isinstance(data, dict):
+        return
+    sid = data.get("session_id")
+    if not isinstance(sid, str) or not sid:
+        return
+    sid = sid[:200]
+    cwd = data.get("cwd") if isinstance(data.get("cwd"), str) and data.get("cwd") else os.getcwd()
+    if event not in ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"):
+        return
+    prompt = data.get("prompt") if event == "UserPromptSubmit" else None
+    if prompt is not None and not isinstance(prompt, str):
+        prompt = None
+    if event == "SessionEnd":
+        # Send first, never run openspec: use only what earlier hooks cached.
+        meta = session_meta(sid)
+        cached = meta.get("ident")
+        if isinstance(cached, dict) and all(isinstance(cached.get(k), str) for k in _IDENT_KEYS) \
+                and cached.get("key"):
+            ident = cached
+        else:
+            ident = project_identity(cwd)
+        change, source = "", ""
+        if isinstance(meta.get("change"), str) and meta["change"]:
+            change, source = meta["change"], "command"
+        else:
+            inf = meta.get("infer")
+            if isinstance(inf, dict) and isinstance(inf.get("change"), str) and isinstance(inf.get("source"), str):
+                change, source = inf["change"], inf["source"]
+        send(cfg, "session", _session_payload("end", sid, ident, cwd, change, source), TIMEOUT_SESSION_END)
+        return
+    ident = project_identity(cwd)
+    if event == "SessionStart":
+        session_meta_update(sid, ident=_clean_ident(ident))
+    change, source = resolve_change(sid, cwd, ident, prompt)
+    _DEADLINE[0] = None
+
+    if event == "SessionStart":
+        send(cfg, "session", _session_payload("start", sid, ident, cwd, change, source), TIMEOUT_SESSION_START)
+        flush_queue(cfg)
+        maybe_spawn_sync(ident, cwd, force=True)
+    elif event == "UserPromptSubmit":
+        send(cfg, "session", _session_payload("heartbeat", sid, ident, cwd, change, source), TIMEOUT_HEARTBEAT)
+        excerpt = ""
+        if os.environ.get("COMPANY_COST_NO_PROMPTS") != "1" and prompt:
+            excerpt = redact_excerpt(prompt)
+        prompt = None
+        data = None
+        if excerpt:
+            send(cfg, "prompt", {"session_id": sid, "excerpt": excerpt, "change_name": change}, TIMEOUT_PROMPT)
+    elif event == "Stop":
+        outcome = send(cfg, "session", _session_payload("heartbeat", sid, ident, cwd, change, source),
+                       TIMEOUT_HEARTBEAT)
+        maybe_spawn_sync(ident, cwd, force=False)
+        if outcome == "ok" and queue_size() > 0:
+            flush_queue(cfg)
+
+
+def hook_entry(argv):
+    """Never raises, never prints. Manual arg parsing only."""
+    try:
+        event = argv[0] if argv else ""
+        raw = sys.stdin.buffer.read(STDIN_MAX).decode("utf-8", "replace")
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return
+        raw = None
+        budget = {"SessionStart": DEADLINE_SESSION_START, "UserPromptSubmit": DEADLINE_USER_PROMPT,
+                  "Stop": DEADLINE_STOP, "SessionEnd": DEADLINE_SESSION_END}.get(event)
+        if budget:
+            _DEADLINE[0] = time.monotonic() + budget
+        run_hook(event, data)
+    except BaseException:
+        pass
+    finally:
+        _DEADLINE[0] = None
+
+
+# ---------------------------------------------------------------------------
+# Sync child
+# ---------------------------------------------------------------------------
+def acquire_sync_lock(key):
+    lock = FileLock(os.path.join(data_dir(), "sync-%s.lock" % key), stale=SYNC_LOCK_STALE, wait=0.0)
+    return lock if lock.acquire() else None
+
+
+def run_sync(cwd):
+    cfg = load_config()
+    if not cfg:
+        return
+    ident = project_identity(cwd)
+    if not ident["branch"]:
+        return
+    try:
+        ensure_data_dir()
+    except OSError:
+        return
+    lock = acquire_sync_lock(_sync_key(ident["key"], ident["branch"]))
+    if lock is None:
+        return
+    key = ident["key"] + "|" + ident["branch"]
+    ok = True
+    skipped = 0
+    try:
+        if in_backoff(load_state()):
+            ok = False
+        else:
+            ol = openspec_list(cwd)
+            root, skipped = resolve_openspec_root(cwd, ident["toplevel"], ol.get("root"))
+            if root:
+                files, sk2, skipped_paths, truncated = collect_files_ex(root)
+                skipped += sk2
+                manifest = [{"path": f["path"], "sha256": f["sha256"]} for f in files]
+                outcome, r = deliver(cfg, "sync/plan", {"project_key": ident["key"], "branch": ident["branch"],
+                                                        "files": manifest}, TIMEOUT_PLAN)
+                lock.refresh()
+                body = r.body if outcome == "ok" and isinstance(r.body, dict) else None
+                if body is None:
+                    ok = False
+                    if outcome == "ok":
+                        mutate_state(lambda st: st.__setitem__("last_error", "bad_response"))
+                else:
+                    upload = body.get("upload")
+                    delete = body.get("delete")
+                    want = set(p for p in upload if isinstance(p, str)) if isinstance(upload, list) else set()
+                    dels = [p for p in delete if isinstance(p, str)] if isinstance(delete, list) else []
+                    dels = safe_deletes(root, dels, skipped_paths, truncated)
+                    chosen = [f for f in files if f["path"] in want]
+                    for b in plan_batches(chosen, dels):
+                        o, _ = deliver(cfg, "sync/files", {"project_key": ident["key"], "branch": ident["branch"],
+                                                           "files": b["files"], "delete": b["delete"]}, TIMEOUT_FILES)
+                        lock.refresh()
+                        if o != "ok":
+                            ok = False
+                            break
+            if ok and ol["changes"]:
+                o, _ = deliver(cfg, "snapshot", {"project_key": ident["key"], "snapshot": {"changes": ol["changes"]}},
+                               TIMEOUT_SNAPSHOT)
+                if o != "ok":
+                    ok = False
+
+        def f(st):
+            if not isinstance(st.get("sync"), dict):
+                st["sync"] = {}
+            if ok:
+                st["sync"][key] = time.time()
+                st["last_sync"] = time.time()
+                st["skipped_files"] = skipped
+            else:
+                # maybe_spawn_sync pre-recorded the throttle key: clear it so the next Stop retries
+                st["sync"].pop(key, None)
+        mutate_state(f)
+    finally:
+        lock.release()
+
+
+# ---------------------------------------------------------------------------
+# Settings merge: setup / uninstall
+# ---------------------------------------------------------------------------
+def load_settings(path):
+    """Return (settings_dict, existed, error)."""
+    if not os.path.exists(path):
+        return {}, False, None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        return None, True, "cannot read %s: %s" % (path, e.strerror)
+    if not text.strip():
+        return {}, True, None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None, True, "%s is not valid JSON; refusing to touch it" % path
+    if not isinstance(data, dict):
+        return None, True, "%s is not a JSON object; refusing to touch it" % path
+    return data, True, None
+
+
+def build_env(url, token):
+    return {
+        "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+        "OTEL_LOGS_EXPORTER": "otlp",
+        "OTEL_METRICS_EXPORTER": "none",
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": url + "/v1/otlp",
+        "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=Bearer " + token,
+        "OTEL_LOGS_EXPORT_INTERVAL": "5000",
+        "OTEL_METRICS_INCLUDE_REPOSITORY": "true",
+        SENTINEL_KEY: "1",
+    }
+
+
+def _write_settings(path, settings, existed):
+    target = os.path.realpath(path) if os.path.islink(path) else path
+    mode = 0o600
+    if existed:
+        try:
+            # the token lives here: keep owner bits, always drop group/other access
+            mode = (os.stat(target).st_mode & 0o600) or 0o600
+        except OSError:
+            pass
+    atomic_write(target, json.dumps(settings, indent=2, ensure_ascii=False) + "\n", mode)
+
+
+def _make_backup(path):
+    bak = backup_path()
+    try:
+        with open(path, "rb") as f:
+            content = f.read()
+        fd = os.open(bak, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except (OSError, FileExistsError):
+        return
+    with os.fdopen(fd, "wb") as f:
+        f.write(content)
+    os.chmod(bak, 0o600)
+
+
+def clear_auth_state():
+    """A fresh setup replaces the rejected token: drop the 401 error and its backoff."""
+    if load_state().get("last_error") != "http_401":
+        return
+
+    def f(st):
+        if st.get("last_error") == "http_401":
+            st["last_error"] = None
+            st["backoff_until"] = 0
+    mutate_state(f)
+
+
+def do_setup(url, token, force, allow_insecure, out, err):
+    cfgdir = config_dir()
+    os.makedirs(cfgdir, exist_ok=True)
+    path = settings_path()
+    settings, existed, problem = load_settings(path)
+    if problem:
+        err.write("error: %s\n" % problem)
+        return 1
+    if "env" in settings and not isinstance(settings["env"], dict):
+        err.write("error: 'env' in %s is not an object; refusing to touch it\n" % path)
+        return 1
+    env_was_missing = "env" not in settings
+    env = settings.get("env", {})
+    wanted = build_env(url, token)
+    side = read_sidecar()
+    managed = env.get(SENTINEL_KEY) == "1"
+    if managed:
+        previous = side.get("previous") if isinstance(side.get("previous"), dict) else {}
+        if isinstance(side.get("env_was_missing"), bool):
+            env_was_missing = side["env_was_missing"]
+    else:
+        conflicts = sorted(k for k in wanted if k != SENTINEL_KEY and k in env and env[k] != wanted[k])
+        if conflicts and not force:
+            err.write("error: settings.json already defines different values for:\n")
+            for k in conflicts:
+                err.write("  - %s\n" % k)
+            err.write("Nothing was changed. Re-run with --force to override (old values are saved and restored on uninstall).\n")
+            return 1
+        previous = dict((k, env[k]) for k in wanted if k in env)
+    _make_backup(path) if existed else None
+    side_doc = {
+        "managed_keys": sorted(wanted),
+        "previous": previous,
+        "env_was_missing": env_was_missing,
+        "url": url,
+        "token": token,
+        "version": VERSION,
+        "allow_insecure": bool(allow_insecure),
+    }
+    atomic_write(sidecar_path(), json.dumps(side_doc, indent=2, sort_keys=True) + "\n", 0o600)
+    env.update(wanted)
+    settings["env"] = env
+    _write_settings(path, settings, existed)
+    clear_auth_state()
+    out.write("company-cost configured.\n")
+    out.write("  URL:   %s\n  token: set (hidden)\n" % url)
+    out.write("  Wrote %d keys to the env block of %s\n" % (len(wanted), path))
+    out.write("Restart Claude Code for telemetry settings to take effect.\n")
+    return 0
+
+
+def find_marketplace():
+    data = read_json_file(os.path.join(config_dir(), "plugins", "installed_plugins.json"))
+    found = []
+
+    def scan(node, depth=0):
+        if depth > 8 or found:
+            return
+        if isinstance(node, dict):
+            for k, v in node.items():
+                m = re.search(r"%s@([A-Za-z0-9._-]+)" % re.escape(PLUGIN_NAME), str(k))
+                if m:
+                    found.append(m.group(1))
+                    return
+                scan(v, depth + 1)
+        elif isinstance(node, list):
+            for v in node:
+                scan(v, depth + 1)
+        elif isinstance(node, str):
+            m = re.search(r"%s@([A-Za-z0-9._-]+)" % re.escape(PLUGIN_NAME), node)
+            if m:
+                found.append(m.group(1))
+    scan(data)
+    return found[0] if found else ""
+
+
+def _own_data_names():
+    names = {PLUGIN_NAME, "%s-%s" % (PLUGIN_NAME, DEFAULT_MARKETPLACE_HINT)}
+    mk = find_marketplace()
+    if mk:
+        names.add("%s-%s" % (PLUGIN_NAME, mk))
+    return names
+
+
+def _remove_data_dirs():
+    """Delete only this plugin's data dirs: exact names, no symlinks, under <cfg>/plugins/data."""
+    root = _plugins_data_root()
+    real_root = os.path.realpath(root)
+    names = _own_data_names()
+    try:
+        listing = os.listdir(root)
+    except OSError:
+        listing = []
+    for fn in listing:
+        full = os.path.join(root, fn)
+        if fn in names and not os.path.islink(full) and os.path.isdir(full):
+            shutil.rmtree(full, ignore_errors=True)
+    pd = os.environ.get("CLAUDE_PLUGIN_DATA")
+    if pd and not os.path.islink(pd.rstrip("/\\")) and os.path.isdir(pd):
+        real = os.path.realpath(pd)
+        if real != real_root and _within(real, real_root):
+            shutil.rmtree(real, ignore_errors=True)
+
+
+def do_uninstall(out, err):
+    path = settings_path()
+    settings, existed, problem = load_settings(path)
+    if problem:
+        err.write("error: %s\n" % problem)
+        return 1
+    side = read_sidecar()
+    env = settings.get("env")
+    changed = False
+    if isinstance(env, dict):
+        keys = None
+        previous = {}
+        wrote = {}
+        if side and isinstance(side.get("managed_keys"), list):
+            # never trust the sidecar beyond the known keys
+            keys = [k for k in side["managed_keys"] if isinstance(k, str) and k in MANAGED_ENV_KEYS]
+            prev = side.get("previous") if isinstance(side.get("previous"), dict) else {}
+            previous = dict((k, v) for k, v in prev.items() if k in MANAGED_ENV_KEYS)
+            if isinstance(side.get("url"), str) and isinstance(side.get("token"), str):
+                wrote = build_env(side["url"], side["token"])
+        elif env.get(SENTINEL_KEY) == "1":
+            keys = list(MANAGED_ENV_KEYS)
+        if keys is not None:
+            still_managed = env.get(SENTINEL_KEY) == "1"
+            for k in keys:
+                if k in env and (still_managed or env[k] == wrote.get(k)):
+                    del env[k]
+                    changed = True
+            for k, v in previous.items():
+                if k not in env:
+                    env[k] = v
+                    changed = True
+            if not env:
+                del settings["env"]
+                changed = True
+    if changed:
+        _write_settings(path, settings, existed)
+    for p in (sidecar_path(), backup_path()):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+    _remove_data_dirs()
+    mk = find_marketplace() or "<marketplace>"
+    out.write("company-cost settings removed.\n")
+    out.write("Next steps, in order:\n")
+    out.write("  1. /company-cost:uninstall   (done)\n")
+    out.write("  2. claude plugin uninstall %s@%s\n" % (PLUGIN_NAME, mk))
+    out.write("  3. claude plugin marketplace remove %s\n" % mk)
+    out.write("  4. Restart Claude Code\n")
+    out.write("  5. Revoke the token at the service\n")
+    if mk == "<marketplace>":
+        out.write("(marketplace name not detected; it is often '%s')\n" % DEFAULT_MARKETPLACE_HINT)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# status / doctor
+# ---------------------------------------------------------------------------
+def _fmt_ts(t):
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(float(t)))
+    except Exception:
+        return "unknown"
+
+
+def do_status(out):
+    out.write("company-cost %s\n" % VERSION)
+    out.write("Server contract: %s\n" % SERVER_CONTRACT)
+    cfg = load_config()
+    if not cfg:
+        out.write("Not configured: run /company-cost:setup\n")
+        return 0
+    out.write("URL: %s\n" % cfg["url"])
+    out.write("Token: set (hidden)\n")
+    side = read_sidecar()
+    settings, _, _ = load_settings(settings_path())
+    env = (settings or {}).get("env")
+    env = env if isinstance(env, dict) else {}
+    keys = side.get("managed_keys") if isinstance(side.get("managed_keys"), list) else list(MANAGED_ENV_KEYS)
+    missing = [k for k in keys if k not in env]
+    if env.get(SENTINEL_KEY) == "1" and not missing:
+        out.write("Managed keys: present (%d)\n" % len(keys))
+    else:
+        out.write("Managed keys: MISSING%s (run /company-cost:setup)\n" % (" " + ",".join(missing) if missing else ""))
+    ep = env.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+    if ep and ep != cfg["url"] + "/v1/otlp":
+        out.write("WARNING: OTLP endpoint in settings.json differs from the configured URL\n")
+    st = load_state()
+    if st.get("last_ok"):
+        out.write("Last ok: %s\n" % _fmt_ts(st["last_ok"]))
+    le = st.get("last_error")
+    if le:
+        if le == "http_401":
+            out.write("Last error: token rejected: re-run /company-cost:setup\n")
+        else:
+            out.write("Last error: %s\n" % le)
+    if in_backoff(st):
+        out.write("Network backoff until: %s\n" % _fmt_ts(st["backoff_until"]))
+    out.write("Queue: %d item(s)\n" % queue_size())
+    out.write("Skipped files (last sync): %s\n" % (st.get("skipped_files") or 0))
+    if st.get("last_sync"):
+        out.write("Last sync: %s\n" % _fmt_ts(st["last_sync"]))
+    if not st.get("last_ok") and not le:
+        out.write("No events seen yet\n")
+    return 0
+
+
+def do_doctor(out):
+    out.write("company-cost doctor (offline)\n")
+    out.write("python: %s\n" % sys.version.split()[0])
+    for tool in ("git", "openspec"):
+        out.write("%s: %s\n" % (tool, shutil.which(tool) or "not found"))
+    out.write("config dir: %s\n" % config_dir())
+    out.write("data dir: %s\n" % data_dir())
+    try:
+        ensure_data_dir()
+        out.write("data dir writable: %s\n" % os.access(data_dir(), os.W_OK))
+    except OSError:
+        out.write("data dir writable: False\n")
+    out.write("configured: %s\n" % ("yes" if load_config() else "no"))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def cmd_setup(argv, out=None, err=None):
+    out = out or sys.stdout
+    err = err or sys.stderr
+    ap = argparse.ArgumentParser(prog="company-cost setup")
+    ap.add_argument("--url")
+    ap.add_argument("--token")
+    ap.add_argument("--token-stdin", action="store_true")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--allow-insecure", action="store_true")
+    args = ap.parse_args(argv)
+    if _is_windows():
+        err.write("error: company-cost setup supports macOS/Linux/WSL only.\n")
+        return 1
+    url = args.url or os.environ.get("CLAUDE_PLUGIN_OPTION_RAG_URL") or ""
+    tty = False
+    try:
+        tty = sys.stdin.isatty()
+    except Exception:
+        pass
+    token = ""
+    if args.token_stdin:
+        token = sys.stdin.readline().strip()
+    elif args.token:
+        err.write("warning: --token exposes the token in argv (process list); prefer --token-stdin.\n")
+        token = args.token
+    else:
+        token = os.environ.get("CLAUDE_PLUGIN_OPTION_RAG_TOKEN") or ""
+    if not url and tty:
+        url = input("Ingest URL: ").strip()
+    if not token and tty and not args.token_stdin:
+        token = getpass.getpass("Token (hidden): ").strip()
+    if not url:
+        err.write("error: no URL given (use --url)\n")
+        return 1
+    clean, problem = validate_url(url, args.allow_insecure)
+    if problem:
+        err.write("error: %s\n" % problem)
+        return 1
+    problem = validate_token(token)
+    if problem:
+        err.write("error: %s\n" % problem)
+        return 1
+    return do_setup(clean, token, args.force, args.allow_insecure, out, err)
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        sys.stdout.write(__doc__)
+        return 0 if argv else 1
+    cmd, rest = argv[0], argv[1:]
+    if cmd in ("setup", "status", "doctor"):
+        use_discovered_data_dir()
+    if cmd == "setup":
+        return cmd_setup(rest)
+    if cmd == "uninstall":
+        return do_uninstall(sys.stdout, sys.stderr)
+    if cmd == "status":
+        return do_status(sys.stdout)
+    if cmd == "doctor":
+        return do_doctor(sys.stdout)
+    if cmd == "_sync":
+        ap = argparse.ArgumentParser(prog="company-cost _sync")
+        ap.add_argument("--cwd", default=os.getcwd())
+        args = ap.parse_args(rest)
+        try:
+            run_sync(args.cwd)
+        except Exception:
+            pass
+        return 0
+    sys.stderr.write("unknown command: %s\n" % cmd)
+    return 2
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "hook":
+        try:
+            sink = open(os.devnull, "w")
+            sys.stdout = sink
+            sys.stderr = sink
+        except BaseException:
+            pass
+        hook_entry(sys.argv[2:])
+        sys.exit(0)
+    sys.exit(main())
