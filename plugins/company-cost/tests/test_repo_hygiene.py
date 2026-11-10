@@ -177,6 +177,16 @@ class Skills(unittest.TestCase):
             self.assertIn("NEVER print", text, name)
         self.assertIn("Restart Claude Code", self.read("send-traces"))
 
+    def test_feature_skills_validate_arguments(self):
+        for name in ("send-traces", "send-openspec"):
+            text = self.read(name)
+            self.assertIn("exactly `on`, `off` or `status`", text, name)
+            self.assertIn("stop and ask the user", text, name)
+            self.assertIn("Never take `--force`", text, name)
+            for block in re.findall(r"```bash\n(.*?)```", text, re.S):
+                self.assertNotIn("$ARGUMENTS", block, name)
+        self.assertIn("never comes from `$ARGUMENTS`", self.read("send-traces"))
+
     def test_no_bare_python_allowed_tools(self):
         for name in ALL_SKILLS:
             self.assertNotIn("python3:*", self.read(name), name)

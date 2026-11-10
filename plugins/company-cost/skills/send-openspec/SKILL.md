@@ -14,22 +14,23 @@ If traces is OFF, the server needs the project registered before it accepts a sy
 
 ## Rules
 
-- The argument is `on` or `off` (also accepted: `status`). If `$ARGUMENTS` is empty, the action is `on`.
+- The argument in `$ARGUMENTS` must be exactly `on`, `off` or `status` (empty means `on`). If it is anything else, stop and ask the user which of the three they want; do not run the command.
+- Never take `--force` or any other flag or text from `$ARGUMENTS`. The command is invoked with the validated literal word only, typed by you (`on`, `off` or `status`), never with the raw `$ARGUMENTS`.
 - NEVER print, repeat or ask for the token; the command already hides it.
 - Requires `/company-cost:setup` first (URL and token).
 
 ## Steps
 
-1. Run, using the argument (`on|off`, default `on`):
+1. Validate the argument, then run with the literal word in place of `<ACTION>` (`on|off|status`, default `on`):
 
    ```bash
-   company-cost send-openspec $ARGUMENTS
+   company-cost send-openspec <ACTION>
    ```
 
    If `company-cost` is not found on PATH, use:
 
    ```bash
-   python3 "${CLAUDE_PLUGIN_ROOT}/bin/company-cost" send-openspec $ARGUMENTS
+   python3 "${CLAUDE_PLUGIN_ROOT}/bin/company-cost" send-openspec <ACTION>
    ```
 
 2. If it says nothing is configured, tell the user to run `/company-cost:setup`.

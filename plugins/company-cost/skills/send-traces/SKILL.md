@@ -12,26 +12,27 @@ Switch the **traces** feature. It covers the OTEL cost export (9 managed keys in
 
 ## Rules
 
-- The argument is `on` or `off` (also accepted: `status`). If `$ARGUMENTS` is empty, the action is `on`.
+- The argument in `$ARGUMENTS` must be exactly `on`, `off` or `status` (empty means `on`). If it is anything else, stop and ask the user which of the three they want; do not run the command.
+- Never take `--force` or any other flag or text from `$ARGUMENTS`. The command is invoked with the validated literal word only, typed by you (`on`, `off` or `status`), never with the raw `$ARGUMENTS`.
 - NEVER print, repeat or ask for the token; the command already hides it.
 - NEVER edit `settings.json` by hand.
-- Use `--force` ONLY after the user has explicitly said yes to overriding existing values.
+- Use `--force` ONLY after listing the conflicting key names to the user and getting an explicit yes to overriding them. `--force` never comes from `$ARGUMENTS`; you add it yourself on that second run only.
 - Requires `/company-cost:setup` first (URL and token).
 
 ## Steps
 
-1. Run, using the argument (`on|off`, default `on`):
+1. Validate the argument, then run with the literal word in place of `<ACTION>` (`on|off|status`, default `on`):
 
    ```bash
-   company-cost send-traces $ARGUMENTS
+   company-cost send-traces <ACTION>
    ```
 
    If `company-cost` is not found on PATH, use:
 
    ```bash
-   python3 "${CLAUDE_PLUGIN_ROOT}/bin/company-cost" send-traces $ARGUMENTS
+   python3 "${CLAUDE_PLUGIN_ROOT}/bin/company-cost" send-traces <ACTION>
    ```
 
 2. If it says nothing is configured, tell the user to run `/company-cost:setup`.
-3. If it reports that `settings.json` already defines different values, show the key names (never values) and ask whether to override. Only on an explicit yes, re-run adding `--force`. `off` restores the old values.
+3. If it reports that `settings.json` already defines different values, show the key names (never values) and ask whether to override. Only on an explicit yes, re-run `send-traces on --force`. `off` restores the old values.
 4. On success tell the user to Restart Claude Code: the OTEL environment is read at startup. Then suggest `/company-cost:status`.
