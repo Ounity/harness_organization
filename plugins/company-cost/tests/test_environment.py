@@ -1,4 +1,4 @@
-"""Optional environment label: user_ref format `agent:<environment>/<name>`."""
+"""Optional environment label: user_ref format `agent:env=<environment>/name=<name>`."""
 import json
 import os
 import time
@@ -19,7 +19,7 @@ class TestEnvironmentValidation(unittest.TestCase):
         self.assertEqual(cc.validate_environment("  prod  "), ("prod", None))
 
     def test_invalid(self):
-        for v in ("", "   ", "x" * 65, "a\nb", "a\x00b", "a​b", "a/b", "/", "prod/", "a;b", "a'b",
+        for v in ("", "   ", "x" * 49, "a\nb", "a\x00b", "a​b", "a/b", "a=b", "/", "prod/", "a;b", "a'b",
                   "password:hunter2", "hro_" + "Ab3dE6gH9k" * 4, "Ａbc", None, 3):
             clean, err = cc.validate_environment(v)
             self.assertIsNone(clean, repr(v))
@@ -31,19 +31,19 @@ class TestEnvironmentValidation(unittest.TestCase):
 
 class TestFormat(unittest.TestCase):
     def test_four_cases(self):
-        self.assertEqual(cc.agent_user_ref("planner", "prod"), "agent:prod/planner")
-        self.assertEqual(cc.agent_user_ref("planner", None), "agent:planner")
-        self.assertEqual(cc.agent_user_ref(None, "prod"), "agent:prod/")
+        self.assertEqual(cc.agent_user_ref("planner", "prod"), "agent:env=prod/name=planner")
+        self.assertEqual(cc.agent_user_ref("planner", None), "agent:name=planner")
+        self.assertEqual(cc.agent_user_ref(None, "prod"), "agent:env=prod")
         self.assertIsNone(cc.agent_user_ref(None, None))
 
     def test_max_length(self):
-        long_name = ("agent " * 11)[:64]
-        long_env = ("stage " * 11)[:64]
+        long_name = ("agent " * 11)[:48]
+        long_env = ("stage " * 11)[:48]
         self.assertLessEqual(len(cc.agent_user_ref(long_name, long_env)), 200)
 
     def test_payload_helper(self):
         ident = {"key": "k", "name": "n", "branch": "b", "repo_display": "r"}
-        for agent, env, exp in (("a", "e", "agent:e/a"), ("a", None, "agent:a"), (None, "e", "agent:e/")):
+        for agent, env, exp in (("a", "e", "agent:env=e/name=a"), ("a", None, "agent:name=a"), (None, "e", "agent:env=e")):
             p = cc._session_payload("start", "s", ident, "/x", None, None, agent=agent, environment=env)
             self.assertEqual(p["user_ref"], exp)
         self.assertNotIn("user_ref", cc._session_payload("start", "s", ident, "/x", None, None))
@@ -82,7 +82,7 @@ class TestEnvironmentSetup(EnvCase):
 
     def test_invalid_rejected_untouched(self):
         self.write_settings({"model": "m"})
-        for bad in ("x" * 65, "a/b", "a;b", "bad\nenv", "password:hunter2", "  "):
+        for bad in ("x" * 49, "a/b", "a;b", "bad\nenv", "password:hunter2", "  "):
             rc, out, err = self.run_cli(["setup", "--url", URL, "--token-stdin", "--environment", bad],
                                         stdin=fake_token() + "\n")
             self.assertEqual(rc, 1, repr(bad))
@@ -111,8 +111,8 @@ class TestEnvironmentResolution(EnvCase):
     def test_user_ref_for(self):
         self.assertIsNone(cc.resolve_user_ref({}))
         os.environ[OPT_ENV] = "dev"
-        self.assertEqual(cc.resolve_user_ref({}), "agent:dev/")
-        self.assertEqual(cc.resolve_user_ref({"agent_name": "p"}), "agent:dev/p")
+        self.assertEqual(cc.resolve_user_ref({}), "agent:env=dev")
+        self.assertEqual(cc.resolve_user_ref({"agent_name": "p"}), "agent:env=dev/name=p")
 
 
 class TestEnvironmentStatus(EnvCase):
@@ -122,7 +122,7 @@ class TestEnvironmentStatus(EnvCase):
             out = self.run_cli([cmd])[1]
             self.assertIn("Environment: prod", out)
             self.assertIn("Agent name: planner", out)
-            self.assertIn("agent:prod/planner", out)
+            self.assertIn("agent:env=prod/name=planner", out)
 
     def test_status_variants(self):
         self.setup_only()
@@ -131,7 +131,7 @@ class TestEnvironmentStatus(EnvCase):
         self.setup_only(extra=["--environment", "dev"])
         out = self.run_cli(["status"])[1]
         self.assertIn("Agent name: not set", out)
-        self.assertIn("agent:dev/", out)
+        self.assertIn("agent:env=dev", out)
 
     def test_status_env_fallback(self):
         self.setup_only()
@@ -149,9 +149,9 @@ class TestEnvironmentPayloads(AgentHookCase):
         write_json(os.path.join(self.cfg, "settings.company-cost.json"), side)
 
     def test_four_combinations_on_all_events(self):
-        for i, (agent, env, exp) in enumerate((("planner", "prod", "agent:prod/planner"),
-                                               ("planner", None, "agent:planner"),
-                                               (None, "prod", "agent:prod/"),
+        for i, (agent, env, exp) in enumerate((("planner", "prod", "agent:env=prod/name=planner"),
+                                               ("planner", None, "agent:name=planner"),
+                                               (None, "prod", "agent:env=prod"),
                                                (None, None, None))):
             self.server.requests[:] = []
             self.conf(agent, env)
@@ -170,10 +170,10 @@ class TestEnvironmentPayloads(AgentHookCase):
     def test_env_option_fallback(self):
         self.conf(None, None)
         self.assertSilent(self.hook("SessionStart", self.base(), env=self.env(**{OPT_ENV: "dev", OPT_AGENT: "p"})))
-        self.assertEqual(self.sessions()[-1]["user_ref"], "agent:dev/p")
+        self.assertEqual(self.sessions()[-1]["user_ref"], "agent:env=dev/name=p")
         self.conf("side", "prod")
         self.assertSilent(self.hook("Stop", self.base(), env=self.env(**{OPT_ENV: "dev", OPT_AGENT: "p"})))
-        self.assertEqual(self.sessions()[-1]["user_ref"], "agent:prod/side")
+        self.assertEqual(self.sessions()[-1]["user_ref"], "agent:env=prod/name=side")
 
     def test_openspec_only_start_and_no_leak_to_sync(self):
         os.makedirs(os.path.join(self.repo, "openspec", "changes", "foo"))
@@ -190,7 +190,7 @@ class TestEnvironmentPayloads(AgentHookCase):
         time.sleep(0.5)
         sessions = self.sessions()
         self.assertEqual(len(sessions), 1)
-        self.assertEqual(sessions[0]["user_ref"], "agent:staging/")
+        self.assertEqual(sessions[0]["user_ref"], "agent:env=staging")
         others = [r for r in self.server.requests if not r["path"].endswith("/session")]
         self.assertTrue(others)
         for r in others:
@@ -200,15 +200,15 @@ class TestEnvironmentPayloads(AgentHookCase):
         self.conf("planner", "prod")
         self.server.responder = lambda r: (500, {}, {})
         self.assertSilent(self.hook("SessionEnd", self.base()))
-        self.assertIn("agent:prod/planner", json.dumps(self.queue_items()))
+        self.assertIn("agent:env=prod/name=planner", json.dumps(self.queue_items()))
         self.conf("other", "dev")
         self.server.responder = self.server.default_responder
         self.server.requests[:] = []
         self.clear_backoff()
         self.assertSilent(self.hook("SessionStart", self.base()))
         by_event = dict((b["event"], b) for b in self.sessions())
-        self.assertEqual(by_event["end"]["user_ref"], "agent:prod/planner")
-        self.assertEqual(by_event["start"]["user_ref"], "agent:dev/other")
+        self.assertEqual(by_event["end"]["user_ref"], "agent:env=prod/name=planner")
+        self.assertEqual(by_event["start"]["user_ref"], "agent:env=dev/name=other")
 
 
 if __name__ == "__main__":

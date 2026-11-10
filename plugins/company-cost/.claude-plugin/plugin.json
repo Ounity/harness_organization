@@ -29,13 +29,19 @@
     "AGENT_NAME": {
       "type": "string",
       "title": "Agent name",
-      "description": "Optional label for the agent being monitored. Sent with each session event as user_ref (agent:<name>); not a filter and not a secret. Max 64 characters: letters, digits, space and . _ - :",
+      "description": "Optional label for the agent being monitored. Sent with each session event as user_ref (agent:name=<name>); not a filter and not a secret. Max 48 characters: letters, digits, space and . _ - :",
       "required": false
     },
     "ENVIRONMENT": {
       "type": "string",
       "title": "Environment",
-      "description": "Optional environment label (dev, staging, prod...). Sent with each session event inside user_ref as agent:<environment>/<name>; not a secret. Max 64 characters: letters, digits, space and . _ - :",
+      "description": "Optional environment label (dev, staging, prod...). Sent with each session event inside user_ref as agent:env=<environment>/name=<name>; not a secret. Max 48 characters: letters, digits, space and . _ - :",
+      "required": false
+    },
+    "TASK": {
+      "type": "string",
+      "title": "Task",
+      "description": "Optional default task label. Overridden per session by the COMPANY_COST_TASK environment variable. Sent inside user_ref as task=<task>; not a secret. Max 48 characters: letters, digits, space and . _ - :",
       "required": false
     }
   }

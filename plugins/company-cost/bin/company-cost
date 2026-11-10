@@ -2,7 +2,7 @@
 """company-cost: Claude Code plugin helper (stdlib only, Python 3.9+).
 
 Commands:
-  company-cost setup [--url U] [--token T] [--token-stdin] [--agent NAME] [--environment ENV] [--force] [--allow-insecure]
+  company-cost setup [--url U] [--token T] [--token-stdin] [--agent NAME] [--environment ENV] [--task TASK] [--force] [--allow-insecure]
   company-cost send-traces [on|off|status] [--force]      (default: on)
   company-cost send-openspec [on|off|status]             (default: on)
   company-cost uninstall
@@ -79,9 +79,11 @@ MAX_DELETE = 500
 
 EXCERPT_SOURCE_CHARS = 8000
 EXCERPT_MAX = 200
-LABEL_MAX = 64
+LABEL_MAX = 48  # worst case user_ref: 6 + 4+48 + 1+5+48 + 1+5+48 = 166 <= 200
 AGENT_ENV = "CLAUDE_PLUGIN_OPTION_AGENT_NAME"
 ENVIRONMENT_ENV = "CLAUDE_PLUGIN_OPTION_ENVIRONMENT"
+TASK_ENV = "CLAUDE_PLUGIN_OPTION_TASK"
+TASK_OVERRIDE_ENV = "COMPANY_COST_TASK"  # per-process override, read by every hook
 
 MANAGED_ENV_KEYS = (
     "CLAUDE_CODE_ENABLE_TELEMETRY",
@@ -442,18 +444,26 @@ def validate_agent_name(name):
     return _validate_label(name, "agent name")
 
 
+def validate_task(task):
+    """Return (clean_task, error). Exactly one is None."""
+    return _validate_label(task, "task")
+
+
 def validate_environment(env):
     """Return (clean_environment, error). Exactly one is None."""
     return _validate_label(env, "environment")
 
 
-def agent_user_ref(name, environment=None):
-    """`agent:<environment>/<name>`, `agent:<name>`, `agent:<environment>/`, or None when both are unset."""
-    if environment:
-        return "agent:%s/%s" % (environment, name or "")
-    if name:
-        return "agent:" + name
-    return None
+def agent_user_ref(name=None, environment=None, task=None):
+    """`agent:env=<environment>/name=<name>/task=<task>` with missing fields omitted; None when all are unset.
+
+    Parse: strip `agent:`, split on `/`, each part is key=value (`/` and `=` never occur inside values).
+    """
+    parts = []
+    for key, value in (("env", environment), ("name", name), ("task", task)):
+        if value:
+            parts.append("%s=%s" % (key, value))
+    return "agent:" + "/".join(parts) if parts else None
 
 
 def _resolve_label(side, key, env_var, validator):
@@ -483,8 +493,28 @@ def resolve_environment(side):
     return _resolve_label(side, "environment", ENVIRONMENT_ENV, validate_environment)
 
 
+def resolve_task_source(side):
+    """(task, source) or (None, None). Precedence: COMPANY_COST_TASK > sidecar `task` > plugin option TASK.
+
+    Invalid values are skipped so the next lower-precedence valid source applies.
+    """
+    stored = side.get("task") if isinstance(side, dict) else None
+    for value, source in ((os.environ.get(TASK_OVERRIDE_ENV), "env var COMPANY_COST_TASK"),
+                          (stored, "sidecar"),
+                          (os.environ.get(TASK_ENV), "plugin option")):
+        if isinstance(value, str) and value.strip():
+            clean, err = validate_task(value)
+            if clean and not err:
+                return clean, source
+    return None, None
+
+
+def resolve_task(side):
+    return resolve_task_source(side)[0]
+
+
 def resolve_user_ref(side):
-    return agent_user_ref(resolve_agent_name(side), resolve_environment(side))
+    return agent_user_ref(resolve_agent_name(side), resolve_environment(side), resolve_task(side))
 
 
 # ---------------------------------------------------------------------------
@@ -1296,7 +1326,7 @@ def flush_queue(cfg, budget=QUEUE_FLUSH_BUDGET, flags=None):
 # ---------------------------------------------------------------------------
 # Hooks
 # ---------------------------------------------------------------------------
-def _session_payload(event, sid, ident, cwd, change, source, agent=None, environment=None):
+def _session_payload(event, sid, ident, cwd, change, source, agent=None, environment=None, task=None):
     """change/source None => the openspec feature is off: the change fields are omitted entirely.
 
     agent / environment (validated or None) form `user_ref` (see agent_user_ref); omitted when both are unset.
@@ -1313,7 +1343,7 @@ def _session_payload(event, sid, ident, cwd, change, source, agent=None, environ
     if change is not None:
         body["change_name"] = change
         body["change_source"] = source
-    ref = agent_user_ref(agent, environment)
+    ref = agent_user_ref(agent, environment, task)
     if ref:
         body["user_ref"] = ref
     return body
@@ -1368,6 +1398,7 @@ def run_hook(event, data):
     sid = sid[:200]
     agent = resolve_agent_name(side)
     environment = resolve_environment(side)
+    task = resolve_task(side)
     cwd = data.get("cwd") if isinstance(data.get("cwd"), str) and data.get("cwd") else os.getcwd()
     if event not in ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"):
         return
@@ -1392,7 +1423,7 @@ def run_hook(event, data):
                 if isinstance(inf, dict) and isinstance(inf.get("change"), str) \
                         and isinstance(inf.get("source"), str):
                     change, source = inf["change"], inf["source"]
-        send(cfg, "session", _session_payload("end", sid, ident, cwd, change, source, agent, environment), TIMEOUT_SESSION_END)
+        send(cfg, "session", _session_payload("end", sid, ident, cwd, change, source, agent, environment, task), TIMEOUT_SESSION_END)
         return
     if event == "UserPromptSubmit" and not costs:
         return  # openspec-only sends nothing per prompt
@@ -1410,12 +1441,12 @@ def run_hook(event, data):
     if event == "SessionStart":
         # With openspec-only this single `start` is the project registration the server needs
         # before it accepts sync/plan (409 unknown_project otherwise).
-        send(cfg, "session", _session_payload("start", sid, ident, cwd, change, source, agent, environment), TIMEOUT_SESSION_START)
+        send(cfg, "session", _session_payload("start", sid, ident, cwd, change, source, agent, environment, task), TIMEOUT_SESSION_START)
         flush_queue(cfg, flags=flags)
         if spec:
             maybe_spawn_sync(ident, cwd, force=True)
     elif event == "UserPromptSubmit":
-        send(cfg, "session", _session_payload("heartbeat", sid, ident, cwd, change, source, agent, environment), TIMEOUT_HEARTBEAT)
+        send(cfg, "session", _session_payload("heartbeat", sid, ident, cwd, change, source, agent, environment, task), TIMEOUT_HEARTBEAT)
         excerpt = ""
         if os.environ.get("COMPANY_COST_NO_PROMPTS") != "1" and prompt:
             excerpt = redact_excerpt(prompt)
@@ -1429,7 +1460,7 @@ def run_hook(event, data):
     elif event == "Stop":
         outcome = None
         if costs:
-            outcome = send(cfg, "session", _session_payload("heartbeat", sid, ident, cwd, change, source, agent, environment),
+            outcome = send(cfg, "session", _session_payload("heartbeat", sid, ident, cwd, change, source, agent, environment, task),
                            TIMEOUT_HEARTBEAT)
         if spec:
             maybe_spawn_sync(ident, cwd, force=False)
@@ -1662,7 +1693,7 @@ def enable_costs(side, force, err):
 
 
 @with_sidecar_lock
-def do_setup(url, token, force, allow_insecure, out, err, agent=None, environment=None):
+def do_setup(url, token, force, allow_insecure, out, err, agent=None, environment=None, task=None):
     """agent / environment: None keeps the stored value, "" clears it, otherwise a validated value replaces it."""
     os.makedirs(config_dir(), exist_ok=True)
     side = read_sidecar()
@@ -1675,6 +1706,9 @@ def do_setup(url, token, force, allow_insecure, out, err, agent=None, environmen
     keep_env = side.get("environment") if environment is None else environment
     if isinstance(keep_env, str) and keep_env:
         new["environment"] = keep_env
+    keep_task = side.get("task") if task is None else task
+    if isinstance(keep_task, str) and keep_task:
+        new["task"] = keep_task
     if feats["costs"]:
         # costs already on: keep settings.json in sync with the (possibly new) URL/token
         rc = enable_costs(new, force, err)
@@ -1689,6 +1723,8 @@ def do_setup(url, token, force, allow_insecure, out, err, agent=None, environmen
         out.write("  agent: %s\n" % (new.get("agent_name") or "not set"))
     if environment is not None:
         out.write("  environment: %s\n" % (new.get("environment") or "not set"))
+    if task is not None:
+        out.write("  task: %s\n" % (new.get("task") or "not set"))
     if feats["costs"]:
         out.write("  Refreshed the managed keys in %s (traces is on). Restart Claude Code.\n" % settings_path())
     if not any(feats.values()):
@@ -1926,9 +1962,11 @@ def _fmt_ts(t):
 def _write_agent(side, out):
     agent = resolve_agent_name(side)
     env = resolve_environment(side)
-    ref = agent_user_ref(agent, env)
+    task, source = resolve_task_source(side)
+    ref = agent_user_ref(agent, env, task)
     out.write("Agent name: %s\n" % (agent or "not set"))
     out.write("Environment: %s\n" % (env or "not set"))
+    out.write("Task: %s\n" % (("%s (source: %s)" % (task, source)) if task else "not set"))
     out.write("user_ref sent: %s\n" % (("`%s`" % ref) if ref else "none (omitted)"))
 
 
@@ -2016,6 +2054,7 @@ def cmd_setup(argv, out=None, err=None):
     ap.add_argument("--token-stdin", action="store_true")
     ap.add_argument("--agent", default=None)
     ap.add_argument("--environment", default=None)
+    ap.add_argument("--task", default=None)
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--allow-insecure", action="store_true")
     args = ap.parse_args(argv)
@@ -2052,7 +2091,8 @@ def cmd_setup(argv, out=None, err=None):
         err.write("error: %s\n" % problem)
         return 1
     labels = {}
-    for attr, validator in (("agent", validate_agent_name), ("environment", validate_environment)):
+    for attr, validator in (("agent", validate_agent_name), ("environment", validate_environment),
+                            ("task", validate_task)):
         raw = getattr(args, attr)
         labels[attr] = raw
         if raw:
@@ -2061,7 +2101,7 @@ def cmd_setup(argv, out=None, err=None):
                 err.write("error: %s\n" % problem)
                 return 1
     return do_setup(clean, token, args.force, args.allow_insecure, out, err,
-                    labels["agent"], labels["environment"])
+                    labels["agent"], labels["environment"], labels["task"])
 
 
 def main(argv=None):

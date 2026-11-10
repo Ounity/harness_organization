@@ -89,7 +89,7 @@ class Manifests(unittest.TestCase):
 
     def test_userconfig_keys(self):
         cfg = self.plugin["userConfig"]
-        self.assertEqual(set(cfg), {"RAG_URL", "RAG_TOKEN", "AGENT_NAME", "ENVIRONMENT"})
+        self.assertEqual(set(cfg), {"RAG_URL", "RAG_TOKEN", "AGENT_NAME", "ENVIRONMENT", "TASK"})
         for name, opt in cfg.items():
             for key in ("type", "title", "description"):
                 self.assertIn(key, opt, name)
@@ -99,6 +99,10 @@ class Manifests(unittest.TestCase):
         self.assertEqual(agent["type"], "string")
         self.assertFalse(agent.get("required"))
         self.assertFalse(agent.get("sensitive"))
+        taskopt = cfg["TASK"]
+        self.assertEqual(taskopt["type"], "string")
+        self.assertFalse(taskopt.get("required"))
+        self.assertFalse(taskopt.get("sensitive"))
         envopt = cfg["ENVIRONMENT"]
         self.assertEqual(envopt["type"], "string")
         self.assertFalse(envopt.get("required"))
@@ -212,6 +216,9 @@ class Skills(unittest.TestCase):
         self.assertIn("optional", text.lower())
         self.assertIn("--environment='<ENV>'", text)
         self.assertNotIn('--environment "', text)
+        self.assertIn("--task='<TASK>'", text)
+        self.assertNotIn('--task "', text)
+        self.assertIn("`=`", text)  # delimiters spelled out as forbidden
         self.assertNotIn('--agent "', text)  # never double-quoted (shell expansion)
 
     def test_uninstall_order(self):

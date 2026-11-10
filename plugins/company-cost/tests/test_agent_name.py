@@ -31,8 +31,8 @@ class TestValidation(unittest.TestCase):
         for name in ("planner", "Code Reviewer 2", "a", "svc.v2_beta:x", "9", "Agénte ñandú"):
             self.ok(name)
         self.ok("  padded  ", "padded")
-        longest = ("agent " * 11)[:64]
-        self.assertEqual(len(longest), 64)
+        longest = ("agent " * 11)[:48]
+        self.assertEqual(len(longest), 48)
         self.ok(longest)
 
     def test_empty_and_whitespace_only(self):
@@ -40,15 +40,15 @@ class TestValidation(unittest.TestCase):
         self.bad("   ")
 
     def test_too_long(self):
-        self.bad("x" * 65)
-        self.bad(" " + "x" * 65 + " ")
+        self.bad("x" * 49)
+        self.bad(" " + "x" * 49 + " ")
 
     def test_control_chars(self):
         for raw in ("a\nb", "a\tb", "a\x00b", "a\x1bb", "a\x7fb", "a\rb", "a​b", "a‮b"):
             self.bad(raw)
 
     def test_disallowed_chars(self):
-        for raw in ("a;b", "team/agent", "/", "a/", "a'b", 'a"b', "a$(x)", "a`b`", "a|b", "a&b", "a\\b", "a<b", "a=b", "a@b", "a#b",
+        for raw in ("a;b", "team/agent", "a=b", "/", "a/", "a'b", 'a"b', "a$(x)", "a`b`", "a|b", "a&b", "a\\b", "a<b", "a=b", "a@b", "a#b",
                     "a*b", "emoji \U0001F600"):
             self.bad(raw)
 
@@ -66,8 +66,8 @@ class TestValidation(unittest.TestCase):
         self.bad("Ａgent")  # fullwidth letter: NFKC would change it (redaction check differs)
 
     def test_user_ref_under_limit(self):
-        self.assertLessEqual(len(cc.agent_user_ref("x" * 64)), 200)
-        self.assertEqual(cc.agent_user_ref("planner"), "agent:planner")
+        self.assertLessEqual(len(cc.agent_user_ref("x" * 48)), 200)
+        self.assertEqual(cc.agent_user_ref("planner"), "agent:name=planner")
 
 
 class TestSetupSemantics(EnvCase):
@@ -119,7 +119,7 @@ class TestSetupSemantics(EnvCase):
     def test_invalid_rejected_without_touching_anything(self):
         original = {"model": "m"}
         self.write_settings(original)
-        for bad in ("x" * 65, "a;b", "bad\nname", "password:hunter2", "   "):
+        for bad in ("x" * 49, "a;b", "bad\nname", "password:hunter2", "   "):
             rc, out, err = self.run_cli(["setup", "--url", URL, "--token-stdin", "--agent", bad],
                                         stdin=fake_token() + "\n")
             self.assertEqual(rc, 1, repr(bad))
@@ -166,7 +166,7 @@ class TestResolution(EnvCase):
     def test_session_payload_helper(self):
         ident = {"key": "k", "name": "n", "branch": "b", "repo_display": "r"}
         p = cc._session_payload("start", "s", ident, "/x", None, None, agent="planner")
-        self.assertEqual(p["user_ref"], "agent:planner")
+        self.assertEqual(p["user_ref"], "agent:name=planner")
         p = cc._session_payload("start", "s", ident, "/x", None, None)
         self.assertNotIn("user_ref", p)
 
@@ -177,7 +177,7 @@ class TestStatus(EnvCase):
         rc, out, _ = self.run_cli(["status"])
         self.assertIn("Agent name: planner", out)
         self.assertIn("user_ref", out)
-        self.assertIn("agent:planner", out)
+        self.assertIn("agent:name=planner", out)
 
     def test_status_not_set(self):
         self.setup_only()
@@ -223,7 +223,7 @@ class TestPayloads(AgentHookCase):
         events = self.sessions()
         self.assertEqual([e["event"] for e in events], ["start", "heartbeat", "heartbeat", "end"])
         for e in events:
-            self.assertEqual(e["user_ref"], "agent:Planner 1")
+            self.assertEqual(e["user_ref"], "agent:name=Planner 1")
             self.assertLessEqual(len(e["user_ref"]), 200)
 
     def test_absent_when_unset(self):
@@ -236,10 +236,10 @@ class TestPayloads(AgentHookCase):
     def test_env_fallback_in_payload_and_sidecar_wins(self):
         self.configure({"costs": True, "openspec": False})
         self.assertSilent(self.hook("SessionStart", self.base(), env=self.env(**{OPT: "envagent"})))
-        self.assertEqual(self.sessions()[-1]["user_ref"], "agent:envagent")
+        self.assertEqual(self.sessions()[-1]["user_ref"], "agent:name=envagent")
         self.configure({"costs": True, "openspec": False}, "sidecar")
         self.assertSilent(self.hook("Stop", self.base(), env=self.env(**{OPT: "envagent"})))
-        self.assertEqual(self.sessions()[-1]["user_ref"], "agent:sidecar")
+        self.assertEqual(self.sessions()[-1]["user_ref"], "agent:name=sidecar")
 
     def test_invalid_env_value_is_silently_ignored(self):
         self.configure({"costs": True, "openspec": False})
@@ -272,7 +272,7 @@ class TestPayloads(AgentHookCase):
         sessions = self.sessions()
         self.assertEqual(len(sessions), 1)
         self.assertEqual(sessions[0]["event"], "start")
-        self.assertEqual(sessions[0]["user_ref"], "agent:planner")
+        self.assertEqual(sessions[0]["user_ref"], "agent:name=planner")
         others = [r for r in self.server.requests if not r["path"].endswith("/session")]
         self.assertTrue([r for r in others if r["path"].endswith("/snapshot")])
         for r in others:
@@ -284,7 +284,7 @@ class TestPayloads(AgentHookCase):
         self.assertSilent(self.hook("SessionEnd", self.base()))
         items = self.queue_items()
         self.assertEqual(len(items), 1)
-        self.assertIn("agent:planner", json.dumps(items[0]))
+        self.assertIn("agent:name=planner", json.dumps(items[0]))
         # the agent changes before replay: the queued item keeps the value built at queue time
         self.configure({"costs": True, "openspec": False}, "other")
         self.server.responder = self.server.default_responder
@@ -293,8 +293,8 @@ class TestPayloads(AgentHookCase):
         self.assertSilent(self.hook("SessionStart", self.base()))
         starts = [b for b in self.sessions()]
         by_event = dict((b["event"], b) for b in starts)
-        self.assertEqual(by_event["end"]["user_ref"], "agent:planner")
-        self.assertEqual(by_event["start"]["user_ref"], "agent:other")
+        self.assertEqual(by_event["end"]["user_ref"], "agent:name=planner")
+        self.assertEqual(by_event["start"]["user_ref"], "agent:name=other")
 
     def test_queued_without_agent_stays_without(self):
         self.configure({"costs": True, "openspec": False})
