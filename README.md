@@ -50,7 +50,7 @@ claude plugin install company-cost@ounity-plugins
 
 ## Setup
 
-In Claude Code run `/company-cost:setup`. It asks for the service URL (for example `https://ingest.example.com`) and your token (`hro_REDACTED`) and stores them in `settings.company-cost.json` (mode 600). **Setup does not enable anything**: it does not touch `settings.json` and nothing is sent. It prints the next steps: `/company-cost:send-traces` and `/company-cost:send-openspec`. It also asks, optionally, for the [agent name and environment](#agent-name-and-environment).
+In Claude Code run `/company-cost:setup`. It asks for the service URL (for example `https://ingest.example.com`) and your token (`hro_REDACTED`) and stores them in `settings.company-cost.json` (mode 600). **Setup does not enable anything**: it does not touch `settings.json` and nothing is sent. It prints the next steps: `/company-cost:send-traces` and `/company-cost:send-openspec`. It also asks, optionally, for the [agent name, environment and task](#agent-name-environment-and-task).
 
 Equivalent from a terminal (the token goes through stdin, never argv):
 
@@ -58,31 +58,51 @@ Equivalent from a terminal (the token goes through stdin, never argv):
 printf '%s\n' "$TOKEN" | company-cost setup --url https://ingest.example.com --token-stdin
 ```
 
-Add `--agent 'NAME'` and/or `--environment 'ENV'` (or the `--agent=NAME` form) to set the optional labels; see [Agent name and environment](#agent-name-and-environment).
+Add `--agent 'NAME'`, `--environment 'ENV'` and/or `--task 'TASK'` (or the `--agent=NAME` form) to set the optional labels; see [Agent name, environment and task](#agent-name-environment-and-task).
 
 Plain `http://` to a non-local host is refused unless `--allow-insecure` is passed. Re-running `setup` with a new token keeps your feature switches; if traces is on it also refreshes the token in `settings.json`.
 
-## Agent name and environment
+## Agent name, environment and task
 
-Two optional labels that tell the service which agent this installation monitors and which environment (dev, staging, prod...) it runs in, so usage can be attributed.
+Three optional labels that tell the service which agent this installation monitors, in which environment (dev, staging, prod...) and for which task, so usage can be attributed.
 
 - **What they are**: labels, not filters. All sessions are still monitored; the labels only travel with them.
-- **Set them**: `/company-cost:setup`, or `company-cost setup --agent 'Code Reviewer' --environment 'prod'`. For each option, re-running `setup` with it replaces the value, `""` clears it, and omitting it keeps the stored value. The plugin options `AGENT_NAME` and `ENVIRONMENT` (env `CLAUDE_PLUGIN_OPTION_AGENT_NAME` / `CLAUDE_PLUGIN_OPTION_ENVIRONMENT`) are used only when the sidecar has no value; the sidecar wins.
-- **Rules (both)**: 1 to 64 characters after trimming; letters, digits, space and `. _ - :`. `/` is NOT allowed because it is the delimiter below. Control characters and anything the prompt redaction would alter (secret-looking text) are rejected; setup exits 1 without changing anything.
+- **Set them**: `/company-cost:setup`, or `company-cost setup --agent 'Code Reviewer' --environment 'prod' --task 'deploy'`. For each option, re-running `setup` with it replaces the value, `""` clears it, and omitting it keeps the stored value. The plugin options `AGENT_NAME`, `ENVIRONMENT` and `TASK` (env `CLAUDE_PLUGIN_OPTION_AGENT_NAME` / `_ENVIRONMENT` / `_TASK`) are used only when the sidecar has no value; the sidecar wins.
+- **Rules (all three)**: 1 to 48 characters after trimming; letters, digits, space and `. _ - :`. `/` and `=` are NOT allowed because they are delimiters (fullwidth and other lookalikes are rejected too). Control characters and anything the prompt redaction would alter (secret-looking text) are rejected; setup exits 1 without changing anything.
 - **Where they are sent**: in the `user_ref` field of every `session` event (`start`, `heartbeat`, `end`, and the lone `start` of openspec-only mode). Prompt, snapshot and sync payloads do not carry it. Queued session events keep the value they were built with.
 
-| Agent name | Environment | `user_ref` |
-|------------|-------------|------------|
-| `planner` | `prod` | `agent:prod/planner` |
-| `planner` | not set | `agent:planner` |
-| not set | `prod` | `agent:prod/` |
-| not set | not set | omitted |
+### Format
 
-`agent:` is a fixed prefix, even when only the environment is set (that is the chosen format). A consumer can split the part after the prefix on the first `/`: if there is one, the left side is the environment and the right side the name (possibly empty); if not, the whole value is the name.
+`user_ref` is `agent:` followed by the set fields, in this fixed order, joined with `/`: `env=<environment>`, `name=<name>`, `task=<task>`. Unset fields are omitted; if all three are unset `user_ref` is omitted.
+
+| Environment | Name | Task | `user_ref` |
+|-------------|------|------|------------|
+| `prod` | `mi-agente` | `deploy` | `agent:env=prod/name=mi-agente/task=deploy` |
+| not set | `mi-agente` | not set | `agent:name=mi-agente` |
+| `prod` | not set | `deploy` | `agent:env=prod/task=deploy` |
+| not set | not set | `deploy` | `agent:task=deploy` |
+| not set | not set | not set | omitted |
+
+Parse rule: strip the `agent:` prefix, split on `/`, and read each part as `key=value`. Values never contain `/` or `=`, and the maximum length is 6 + (4+48) + (1+5+48) + (1+5+48) = 166 characters, under the 200 the field allows.
+
+### One task per session (LangChain nodes and similar)
+
+The task can change per session. Every hook reads the process environment variable `COMPANY_COST_TASK`, which overrides the default. Precedence: `COMPANY_COST_TASK` > sidecar `task` (`setup --task`) > plugin option `TASK`. An invalid value (from any source) is ignored silently and the next valid source applies, or the segment is omitted.
+
+Claude Code hook processes inherit the environment of the Claude Code process, so a workflow node must export the variable before launching `claude`:
+
+```python
+import os, subprocess
+
+subprocess.run(["claude", "-p", prompt],
+               env={**os.environ, "COMPANY_COST_TASK": "summarize"})
+```
+
+One session carries one task: `start`, `heartbeat` and `end` all read the same variable, so it must stay constant for the process. If it is unset at a later hook, that hook falls back to the sidecar/plugin default; a new task needs a new session. This environment-inheritance behavior was NOT verified against a live Claude Code run.
 
 - **Visibility**: plain text visible to whoever operates the service. They are not secrets; do not put one in them.
-- **Caution**: this reuses the service's optional `user_ref` field. The field's purpose on the server is not documented in this repo. If your service uses `user_ref` for end-user identity, tell its operator before you set either value.
-- `/company-cost:status` and `company-cost doctor` show `Agent name`, `Environment` and the exact `user_ref` that will be sent. `uninstall` removes them with the sidecar.
+- **Caution**: this reuses the service's optional `user_ref` field. The field's purpose on the server is not documented in this repo. If your service uses `user_ref` for end-user identity, tell its operator before you set any of these values.
+- `/company-cost:status` and `company-cost doctor` show `Agent name`, `Environment`, `Task` (with its source: env var, sidecar or plugin option) and the exact `user_ref` that would be sent. `uninstall` removes the stored values with the sidecar.
 
 ## Choose what is sent
 
@@ -195,7 +215,7 @@ Authentication: `Authorization: Bearer hro_...` on every request. All plugin req
 | Endpoint | Purpose |
 |----------|---------|
 | `/v1/otlp` (+ `/v1/logs` appended by the exporter) | OTLP http/json log events (cost) |
-| `/v1/ingest/plugin/session` | session start / heartbeat / end (optional `user_ref`: `agent:<environment>/<name>`, see [Agent name and environment](#agent-name-and-environment)) |
+| `/v1/ingest/plugin/session` | session start / heartbeat / end (optional `user_ref`: `agent:env=<environment>/name=<name>/task=<task>`, see [Agent name, environment and task](#agent-name-environment-and-task)) |
 | `/v1/ingest/plugin/prompt` | redacted prompt excerpt |
 | `/v1/ingest/plugin/snapshot` | OpenSpec change snapshot |
 | `/v1/ingest/plugin/sync/plan` | receives file manifest, returns `{"upload": [paths], "delete": [paths]}` |

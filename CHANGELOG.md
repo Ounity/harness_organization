@@ -5,10 +5,11 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 ## [0.3.0] - 2026-11-10
 
 ### Added
-- Optional agent name and environment: `company-cost setup --agent NAME --environment ENV` (`""` clears either; omitting keeps the stored value), stored in the sidecar as `agent_name` and `environment`, with the plugin options `AGENT_NAME` and `ENVIRONMENT` as fallbacks when the sidecar has none.
-- When set, every session event (`start`, `heartbeat`, `end`, and the lone `start` of openspec-only mode) carries `user_ref`: `agent:<environment>/<name>`, `agent:<name>` (no environment), `agent:<environment>/` (no name; `agent:` stays a fixed prefix) or omitted when neither is set. Prompt, snapshot and sync payloads are unchanged. They are labels, not filters.
-- Validation (both): 1 to 64 characters, letters/digits/space and `. _ - :` (no `/`, it is the delimiter), no control characters, nothing the prompt redaction would alter.
-- `status` and `doctor` show `Agent name`, `Environment` and the exact `user_ref` sent; the `setup` skill asks for both (optional) with strict quoting rules.
+- Three optional labels: agent name, environment and task. `company-cost setup --agent NAME --environment ENV --task TASK` (`""` clears one; omitting keeps the stored value), stored in the sidecar as `agent_name`, `environment` and `task`, with the plugin options `AGENT_NAME`, `ENVIRONMENT` and `TASK` as fallbacks when the sidecar has none.
+- When set, every session event (`start`, `heartbeat`, `end`, and the lone `start` of openspec-only mode) carries `user_ref` = `agent:` plus the set fields as `env=<environment>/name=<name>/task=<task>` in that order (for example `agent:env=prod/name=mi-agente/task=deploy`); unset fields are omitted and `user_ref` is omitted when all are unset. Parse: strip `agent:`, split on `/`, each part is `key=value`. Prompt, snapshot and sync payloads are unchanged. They are labels, not filters.
+- Per-session task: every hook reads the `COMPANY_COST_TASK` environment variable, which overrides the sidecar `task`, which overrides the `TASK` plugin option (invalid values fall through). Meant for workflow nodes that each launch their own Claude Code session.
+- Validation (all three): 1 to 48 characters, letters/digits/space and `. _ - :` (`/` and `=` are delimiters and rejected), no control characters, nothing the prompt redaction would alter. Worst-case `user_ref` is 166 characters.
+- `status` and `doctor` show `Agent name`, `Environment`, `Task` (with its source) and the exact `user_ref` sent; the `setup` skill asks for all three (optional) with strict quoting rules.
 
 ## [0.2.0] - 2026-11-10
 
