@@ -218,7 +218,8 @@ class Skills(unittest.TestCase):
         self.assertNotIn('--environment "', text)
         self.assertIn("--task='<TASK>'", text)
         self.assertNotIn('--task "', text)
-        self.assertIn("`=`", text)  # delimiters spelled out as forbidden
+        self.assertIn("`/` and `=` are NOT allowed, they are delimiters", text)
+        self.assertIn("REFUSE anything else, including `/` and `=`", text)
         self.assertNotIn('--agent "', text)  # never double-quoted (shell expansion)
 
     def test_uninstall_order(self):

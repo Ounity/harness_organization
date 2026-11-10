@@ -133,21 +133,24 @@ class TestTaskSetup(EnvCase):
 
 class TestTaskPrecedence(EnvCase):
     def test_matrix(self):
-        for var, sidecar, opt in itertools.product((None, "fromvar", "bad/var"), (None, "side", "bad=side"),
+        for var, sidecar, opt in itertools.product((None, "", "fromvar", "bad/var"), (None, "side", "bad=side"),
                                                    (None, "opt", "bad opt;")):
             for k in (TASK_ENV, TASK_OPT):
                 os.environ.pop(k, None)
-            if var:
+            if var is not None:
                 os.environ[TASK_ENV] = var
             if opt:
                 os.environ[TASK_OPT] = opt
             side = {"task": sidecar} if sidecar else {}
-            chain = [(var, "env var COMPANY_COST_TASK"), (sidecar, "sidecar"), (opt, "plugin option")]
-            want = (None, None)
-            for value, src in chain:
-                if value and cc.validate_task(value)[0]:
-                    want = (value, src)
-                    break
+            if var:
+                # set to a non-empty value: valid wins, invalid omits the task (no fall-through)
+                want = (var, "env var COMPANY_COST_TASK") if cc.validate_task(var)[0] else (None, None)
+            else:
+                want = (None, None)
+                for value, src in ((sidecar, "sidecar"), (opt, "plugin option")):
+                    if value and cc.validate_task(value)[0]:
+                        want = (value, src)
+                        break
             self.assertEqual(cc.resolve_task_source(side), want, (var, sidecar, opt))
             self.assertEqual(cc.resolve_task(side), want[0])
 
@@ -178,6 +181,15 @@ class TestTaskStatus(EnvCase):
         self.assertIn("Task: fromvar", out)
         self.assertIn("COMPANY_COST_TASK", out)
         self.assertIn("agent:task=fromvar", out)
+        os.environ[TASK_ENV] = "bad/var"
+        out = self.run_cli(["status"])[1]
+        self.assertIn("COMPANY_COST_TASK is set but invalid", out)
+        self.assertIn("task omitted", out)
+        self.assertNotIn("Task: optional", out)
+        self.assertIn("user_ref sent: none", out)
+        self.assertIn("COMPANY_COST_TASK is set but invalid", self.run_cli(["doctor"])[1])
+        os.environ[TASK_ENV] = ""
+        self.assertIn("Task: optional", self.run_cli(["status"])[1])
 
 
 class TestTaskHooks(AgentHookCase):
@@ -211,24 +223,44 @@ class TestTaskHooks(AgentHookCase):
         for e in self.sessions():
             self.assertEqual(e["user_ref"], "agent:env=prod/name=mi-agente/task=summarize")
 
-    def test_precedence_in_hooks_and_invalid_falls_through(self):
+    def test_precedence_in_hooks_and_invalid_env_var_omits(self):
         self.conf(task="side")
-        steps = (({TASK_ENV: "var", TASK_OPT: "opt"}, "var"),
-                 ({TASK_ENV: "bad/var", TASK_OPT: "opt"}, "side"),
-                 ({TASK_OPT: "opt"}, "side"))
+        steps = (({TASK_ENV: "var", TASK_OPT: "opt"}, "agent:task=var"),
+                 ({TASK_ENV: "bad/var", TASK_OPT: "opt"}, None),  # invalid env var: omitted, no fall-through
+                 ({TASK_ENV: "", TASK_OPT: "opt"}, "agent:task=side"),  # empty means not provided
+                 ({TASK_OPT: "opt"}, "agent:task=side"))
         for extra, want in steps:
             self.server.requests[:] = []
             self.assertSilent(self.hook("Stop", self.base(), env=self.env(**extra)))
-            self.assertEqual(self.sessions()[-1]["user_ref"], "agent:task=" + want)
-        self.conf()
-        for extra, want in (({TASK_ENV: "bad=var", TASK_OPT: "opt"}, "opt"), ({TASK_ENV: "bad=var"}, None)):
-            self.server.requests[:] = []
-            self.assertSilent(self.hook("Stop", self.base(), env=self.env(**extra)))
             ses = self.sessions()[-1]
-            if want:
-                self.assertEqual(ses["user_ref"], "agent:task=" + want)
+            if want is None:
+                self.assertNotIn("user_ref", ses, extra)
             else:
-                self.assertNotIn("user_ref", ses)
+                self.assertEqual(ses["user_ref"], want, extra)
+        self.conf()
+        # invalid values in the sidecar / plugin option keep falling through
+        write_json(os.path.join(self.cfg, "settings.company-cost.json"),
+                   {"features": {"costs": True, "openspec": False}, "task": "bad=side"})
+        self.server.requests[:] = []
+        self.assertSilent(self.hook("Stop", self.base(), env=self.env(**{TASK_OPT: "opt"})))
+        self.assertEqual(self.sessions()[-1]["user_ref"], "agent:task=opt")
+
+    def test_invalid_env_var_values_at_hook_level(self):
+        self.conf("mi-agente", "prod", "default")
+        base_ref = "agent:env=prod/name=mi-agente"
+        cases = (("100KB", "x" * 100000, None), ("non-utf8", b"\xff\xfe", None),
+                 ("sk", "sk-" + "A1b2C3d4" * 6, None), ("ghp", "ghp_" + "A1b2C3d4" * 5, None),
+                 ("slash", "a/b", None), ("equals", "a=b", None),
+                 ("empty", "", base_ref + "/task=default"))
+        for label, value, want in cases:
+            for event in ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"):
+                self.server.requests[:] = []
+                extra = {"prompt": "hi"} if event == "UserPromptSubmit" else {}
+                p = self.hook(event, self.base(**extra), env=self.env(**{TASK_ENV: value}))
+                self.assertSilent(p)
+                for ses in self.sessions():
+                    self.assertEqual(ses["user_ref"], want or base_ref, (label, event))
+                self.assertTrue(self.sessions(), (label, event))
 
     def test_later_hook_without_env_var_falls_back(self):
         self.conf(task="default")

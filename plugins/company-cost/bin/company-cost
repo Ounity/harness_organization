@@ -493,15 +493,25 @@ def resolve_environment(side):
     return _resolve_label(side, "environment", ENVIRONMENT_ENV, validate_environment)
 
 
+def task_override_invalid():
+    """True when COMPANY_COST_TASK is set to a non-empty value that fails validation."""
+    raw = os.environ.get(TASK_OVERRIDE_ENV)
+    return bool(raw) and validate_task(raw)[0] is None
+
+
 def resolve_task_source(side):
     """(task, source) or (None, None). Precedence: COMPANY_COST_TASK > sidecar `task` > plugin option TASK.
 
-    Invalid values are skipped so the next lower-precedence valid source applies.
+    COMPANY_COST_TASK unset or empty means "not provided". Set to an invalid value, the task is OMITTED
+    (no fall-through: a missing label is visibly wrong, a stale default looks plausible). Invalid sidecar
+    or plugin-option values are skipped so the next source applies.
     """
+    raw = os.environ.get(TASK_OVERRIDE_ENV)
+    if raw:
+        clean, err = validate_task(raw)
+        return (clean, "env var COMPANY_COST_TASK") if clean and not err else (None, None)
     stored = side.get("task") if isinstance(side, dict) else None
-    for value, source in ((os.environ.get(TASK_OVERRIDE_ENV), "env var COMPANY_COST_TASK"),
-                          (stored, "sidecar"),
-                          (os.environ.get(TASK_ENV), "plugin option")):
+    for value, source in ((stored, "sidecar"), (os.environ.get(TASK_ENV), "plugin option")):
         if isinstance(value, str) and value.strip():
             clean, err = validate_task(value)
             if clean and not err:
@@ -1966,7 +1976,12 @@ def _write_agent(side, out):
     ref = agent_user_ref(agent, env, task)
     out.write("Agent name: %s\n" % (agent or "not set"))
     out.write("Environment: %s\n" % (env or "not set"))
-    out.write("Task: %s\n" % (("%s (source: %s)" % (task, source)) if task else "not set"))
+    if task:
+        out.write("Task: %s (source: %s)\n" % (task, source))
+    elif task_override_invalid():
+        out.write("Task: not set (COMPANY_COST_TASK is set but invalid: task omitted, defaults ignored)\n")
+    else:
+        out.write("Task: not set\n")
     out.write("user_ref sent: %s\n" % (("`%s`" % ref) if ref else "none (omitted)"))
 
 

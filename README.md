@@ -87,7 +87,7 @@ Parse rule: strip the `agent:` prefix, split on `/`, and read each part as `key=
 
 ### One task per session (LangChain nodes and similar)
 
-The task can change per session. Every hook reads the process environment variable `COMPANY_COST_TASK`, which overrides the default. Precedence: `COMPANY_COST_TASK` > sidecar `task` (`setup --task`) > plugin option `TASK`. An invalid value (from any source) is ignored silently and the next valid source applies, or the segment is omitted.
+The task can change per session. Every hook reads the process environment variable `COMPANY_COST_TASK`, which overrides the default. Precedence: `COMPANY_COST_TASK` > sidecar `task` (`setup --task`) > plugin option `TASK`. An unset or empty `COMPANY_COST_TASK` means "not provided" and the sidecar, then the plugin option, apply. If it is set to a non-empty value that fails validation, the task segment is OMITTED from `user_ref` and the sidecar and plugin-option defaults are NOT used (a missing label is visibly wrong, a stale default looks plausible); hooks stay silent. Invalid values in the sidecar or the plugin option are ignored and the next source applies.
 
 Claude Code hook processes inherit the environment of the Claude Code process, so a workflow node must export the variable before launching `claude`:
 
@@ -102,7 +102,7 @@ One session carries one task: `start`, `heartbeat` and `end` all read the same v
 
 - **Visibility**: plain text visible to whoever operates the service. They are not secrets; do not put one in them.
 - **Caution**: this reuses the service's optional `user_ref` field. The field's purpose on the server is not documented in this repo. If your service uses `user_ref` for end-user identity, tell its operator before you set any of these values.
-- `/company-cost:status` and `company-cost doctor` show `Agent name`, `Environment`, `Task` (with its source: env var, sidecar or plugin option) and the exact `user_ref` that would be sent. `uninstall` removes the stored values with the sidecar.
+- `/company-cost:status` and `company-cost doctor` show `Agent name`, `Environment`, `Task` (with its source: env var, sidecar or plugin option; it also says when `COMPANY_COST_TASK` is set but invalid and the task is omitted) and the exact `user_ref` that would be sent. `uninstall` removes the stored values with the sidecar.
 
 ## Choose what is sent
 
