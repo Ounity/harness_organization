@@ -1,18 +1,23 @@
 # company-cost
 
-A Claude Code plugin that reports **cost telemetry** and **OpenSpec progress** from your sessions to an *ingest service* that you (or your organization) operate.
+A Claude Code plugin that reports **cost telemetry** and **OpenSpec progress** from your sessions to an *ingest service* that you (or your organization) operate. Nothing is sent until you switch on one of two independent features: **traces** and **openspec** (see [Choose what is sent](#choose-what-is-sent)).
 
-- Status: `0.1.0`, license Apache-2.0
+- Status: `0.2.0`, license Apache-2.0
 - Platforms: **macOS, Linux, WSL**. Native Windows is **not supported** in this release.
 
 ## What it collects
 
+What is collected depends on which features you enabled.
+
 | Collected | Details |
 |-----------|---------|
-| Cost telemetry | Claude Code's own OpenTelemetry events, sent to `<URL>/v1/otlp` |
-| Session metadata | session id, project key (normalized git remote), branch name, change name, hash of the working directory. Outside a git repo the folder name is sent as the project name |
-| Prompt excerpts | at most 200 characters per prompt, secrets redacted (see below) |
-| OpenSpec files | `*.md` under your repo's `openspec/` (or `specs/`) directory, excluding `changes/archive` |
+| Cost telemetry (traces) | Claude Code's own OpenTelemetry events, sent to `<URL>/v1/otlp` |
+| Session metadata (traces) | session id, project key (normalized git remote), branch name, hash of the working directory. Outside a git repo the folder name is sent as the project name |
+| Change name and source (openspec) | the OpenSpec change inferred from your command, branch or most recent change |
+| Prompt excerpts (traces) | at most 200 characters per prompt, secrets redacted (see below) |
+| OpenSpec files (openspec) | `*.md` under your repo's `openspec/` (or `specs/`) directory, excluding `changes/archive` |
+
+**Privacy statement:** with only **traces** enabled, no OpenSpec file ever leaves your machine (and no `openspec` command is run). With only **openspec** enabled, no cost telemetry, heartbeat, end event or prompt excerpt is sent; the single exception is one session `start` event per session, used as project registration (see below). With neither enabled the hooks do nothing.
 
 **Not collected:** full prompts, model responses, source code outside the OpenSpec directory, file paths of your machine (only a hash of the working directory).
 
@@ -24,8 +29,8 @@ Excerpts are redacted (keys, bearer tokens, URLs with credentials, long random s
 
 | Variable | Effect |
 |----------|--------|
-| `COMPANY_COST_NO_PROMPTS=1` | never send prompt excerpts |
-| `COMPANY_COST_NO_SYNC=1` | never sync OpenSpec files |
+| `COMPANY_COST_NO_PROMPTS=1` | never send prompt excerpts (traces) |
+| `COMPANY_COST_NO_SYNC=1` | never sync OpenSpec files (openspec) |
 
 Set them in your shell or in the `env` block of your settings.
 
@@ -45,7 +50,7 @@ claude plugin install company-cost@ounity-plugins
 
 ## Setup
 
-In Claude Code run `/company-cost:setup`. It asks for the service URL (for example `https://ingest.example.com`) and your token (`hro_REDACTED`), then writes the telemetry settings into your **user** settings (`~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR`). Restart Claude Code afterwards.
+In Claude Code run `/company-cost:setup`. It asks for the service URL (for example `https://ingest.example.com`) and your token (`hro_REDACTED`) and stores them in `settings.company-cost.json` (mode 600). **Setup does not enable anything**: it does not touch `settings.json` and nothing is sent. It prints the next steps: `/company-cost:send-traces` and `/company-cost:send-openspec`.
 
 Equivalent from a terminal (the token goes through stdin, never argv):
 
@@ -53,16 +58,45 @@ Equivalent from a terminal (the token goes through stdin, never argv):
 printf '%s\n' "$TOKEN" | company-cost setup --url https://ingest.example.com --token-stdin
 ```
 
-What `setup` writes into the `env` block of `settings.json` (9 keys):
-`CLAUDE_CODE_ENABLE_TELEMETRY`, `OTEL_LOGS_EXPORTER`, `OTEL_METRICS_EXPORTER`, `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_LOGS_EXPORT_INTERVAL`, `OTEL_METRICS_INCLUDE_REPOSITORY`, `COMPANY_COST_MANAGED` (marker used by uninstall).
+Plain `http://` to a non-local host is refused unless `--allow-insecure` is passed. Re-running `setup` with a new token keeps your feature switches; if traces is on it also refreshes the token in `settings.json`.
 
-`settings.json` is always rewritten with owner-only permissions (mode 600; group/other bits are removed because the token lives there). It also creates `settings.company-cost.json` (mode 600, holds URL and token for the hooks and records previous values) and a one-time backup `settings.json.company-cost.bak` (kept until you run uninstall, which deletes it). If you already have different values for those keys it stops; `--force` overrides them, and uninstall restores the old ones. Plain `http://` to a non-local host is refused unless `--allow-insecure` is passed.
+## Choose what is sent
 
-> OTEL variables placed in a repository's `.claude/settings*.json` are **ignored** by Claude Code. They must live in user settings, managed settings or your shell, which is what `setup` does.
+Two independent, persistent switches. `on` is the default action when no argument is given.
+
+| Feature | What is sent | Endpoints | Enable / disable |
+|---------|--------------|-----------|------------------|
+| **traces** (OTEL cost export, session events, prompt excerpt) | the 9 OTEL keys written to `settings.json` (Claude Code then exports cost events); session `start` / `heartbeat` / `end` (project, branch, cwd hash); redacted prompt excerpt (200 chars max; `COMPANY_COST_NO_PROMPTS=1` still applies) | `/v1/otlp`, `/v1/ingest/plugin/session`, `/v1/ingest/plugin/prompt` | `/company-cost:send-traces [on\|off]` or `company-cost send-traces [on\|off\|status]` |
+| **openspec** (change tracking and file mirror) | change inference (command, branch, recent) so `change_name` / `change_source` are sent; the OpenSpec file mirror; the change snapshot (`COMPANY_COST_NO_SYNC=1` still applies) | `/v1/ingest/plugin/sync/plan`, `sync/files`, `snapshot` (plus the registration `start` event below) | `/company-cost:send-openspec [on\|off]` or `company-cost send-openspec [on\|off\|status]` |
+
+"Traces" covers the OTEL cost export, the session events and the prompt excerpt (the excerpt travels with the traces).
+
+**send-traces on** writes these keys into the `env` block of `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`): `CLAUDE_CODE_ENABLE_TELEMETRY`, `OTEL_LOGS_EXPORTER`, `OTEL_METRICS_EXPORTER`, `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_LOGS_EXPORT_INTERVAL`, `OTEL_METRICS_INCLUDE_REPOSITORY`, `COMPANY_COST_MANAGED` (marker). `settings.json` is rewritten atomically with owner-only permissions (mode 600; group/other bits are removed because the token lives there), after a one-time backup `settings.json.company-cost.bak` (kept until uninstall). If you already have different values for those keys it stops; `--force` overrides them and `send-traces off` (or uninstall) restores the old ones. **Restart Claude Code** after `send-traces on` or `off`: the OTEL environment is read at startup.
+
+**send-traces off** removes exactly those keys and restores the previous values; URL and token stay in the sidecar, so you can switch it on again without running `setup`. **send-openspec on|off** only flips a flag (hooks read it on every event, no restart needed). Both require `setup` first; `send-traces on` without a configured URL/token fails with exit code 1 and points to `/company-cost:setup`.
+
+### Registration exception when only openspec is on
+
+The server answers `409 unknown_project` to `sync/plan` unless a session event for that project was received first. So with **openspec on and traces off**, the plugin sends exactly one session `start` event per session (project, branch, cwd hash, change name/source) as project registration, and then runs change inference, sync and snapshot. It sends no heartbeat, no `end` event and no prompt excerpt, and no OTEL keys are written.
+
+### Hook behavior per combination
+
+| traces | openspec | Hooks do |
+|--------|----------|----------|
+| off | off | nothing (silent no-op, no network, no subprocess) |
+| on | off | start / heartbeat / end + excerpt, **without** change fields; no `openspec` command, no sync, no snapshot |
+| off | on | only the registration `start`, then inference, sync, snapshot |
+| on | on | everything (same as 0.1.0) |
+
+> OTEL variables placed in a repository's `.claude/settings*.json` are **ignored** by Claude Code. They must live in user settings, managed settings or your shell, which is what `send-traces on` does.
+
+### Upgrading from 0.1.0
+
+Existing installs keep working exactly as before: a sidecar without a `features` entry is treated as **both features enabled**. Run `/company-cost:send-traces off` or `/company-cost:send-openspec off` to narrow it. New installs start with both off.
 
 ## Verify
 
-1. Restart Claude Code, run `/company-cost:status`: it should show `Managed keys: present (9)`.
+1. Run `/company-cost:send-traces`, restart Claude Code, then `/company-cost:status`: it should show `traces: enabled` and `Managed keys: present (9)`.
 2. Send a prompt, then check `/company-cost:status` again: `Last ok` should appear and `Queue` should be 0.
 3. Check at your service that cost events arrive.
 
@@ -70,12 +104,12 @@ Honest caveat: Claude Code's docs do not state that the OTLP exporter appends `/
 
 ## Status and diagnostics
 
-- `/company-cost:status` (or `company-cost status`): URL, whether keys are present, last success, last error, backoff, queue size, last sync. The token is never printed.
-- `company-cost doctor`: offline checks (python, git, openspec, directories).
+- `/company-cost:status` (or `company-cost status`): URL, each feature enabled/disabled with what it sends (and the registration exception when openspec runs alone), whether keys are present, last success, last error, backoff, queue size, last sync. The token is never printed.
+- `company-cost doctor`: offline checks (python, git, openspec, directories, feature switches).
 
 ## Uninstall (order matters)
 
-1. `/company-cost:uninstall` inside Claude Code (restores your previous values, then deletes the sidecar, the settings backup and the plugin data directory)
+1. `/company-cost:uninstall` inside Claude Code (restores your previous values, then deletes the sidecar with the feature switches, the settings backup and the plugin data directory; works whether the features are on or off)
 2. `claude plugin uninstall company-cost@ounity-plugins`
 3. `claude plugin marketplace remove ounity-plugins`
 4. Restart Claude Code
@@ -117,7 +151,7 @@ Deploy a managed settings file: macOS `/Library/Application Support/ClaudeCode/m
 }
 ```
 
-Do not include `COMPANY_COST_MANAGED`. **Warning:** the token in a managed file is readable by every local user of the machine. Hooks still need the URL and token: users run `/company-cost:setup`, or provide the plugin options `RAG_URL` / `RAG_TOKEN`.
+Do not include `COMPANY_COST_MANAGED`. **Warning:** the token in a managed file is readable by every local user of the machine. Hooks still need the URL and token: users run `/company-cost:setup`, or provide the plugin options `RAG_URL` / `RAG_TOKEN`. Hooks only act for enabled features: after `setup` run `/company-cost:send-traces` (identical managed values are not a conflict) and/or `/company-cost:send-openspec`. With only the plugin options (no sidecar) both features are treated as enabled, as in 0.1.0.
 
 ## Known limitations
 
@@ -143,16 +177,18 @@ Authentication: `Authorization: Bearer hro_...` on every request. All plugin req
 | `/v1/ingest/plugin/sync/plan` | receives file manifest, returns `{"upload": [paths], "delete": [paths]}` |
 | `/v1/ingest/plugin/sync/files` | receives file contents and deletions |
 
-The plugin never follows redirects. 401 is reported as a rejected token and pauses delivery for about 15 minutes (a successful `setup` clears it; queued items are kept); 429, 5xx and network errors are queued and retried with backoff. Other 4xx responses are dropped.
+The plugin never follows redirects. 401 is reported as a rejected token and pauses delivery for about 15 minutes (a successful `setup` clears it; queued items are kept; queued items of a feature you disabled are dropped, not sent); 429, 5xx and network errors are queued and retried with backoff. Other 4xx responses are dropped.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
 | `Not configured` | run `/company-cost:setup` |
-| `Managed keys: MISSING` | re-run `/company-cost:setup`, then restart |
+| Nothing is sent after setup | expected: enable `/company-cost:send-traces` and/or `/company-cost:send-openspec` |
+| `409 unknown_project` on sync | the session `start` event did not arrive yet; it is queued and retried |
+| `Managed keys: MISSING` | re-run `/company-cost:send-traces`, then restart |
 | `token rejected` | get a new token, re-run `/company-cost:setup` |
-| setup lists conflicting keys | review them; re-run with `--force` only if you accept overriding |
+| send-traces lists conflicting keys | review them; re-run with `--force` only if you accept overriding |
 | `refusing plain http://` | use `https://` (or `--allow-insecure` for a trusted network) |
 | Queue keeps growing | check URL, network, `status` last error |
 | No cost events at the service | restart Claude Code; confirm the service accepts `<URL>/v1/otlp/v1/logs` |

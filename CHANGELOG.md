@@ -2,6 +2,23 @@
 
 All notable changes are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [SemVer](https://semver.org/). Releases are tagged `vX.Y.Z`.
 
+## [0.2.0] - 2026-11-10
+
+### Added
+- Two independent, persistent feature switches: **traces** (OTEL cost export, session events, redacted prompt excerpt) and **openspec** (change inference, OpenSpec file mirror, snapshot).
+- Skills `/company-cost:send-traces` and `/company-cost:send-openspec`, and CLI `company-cost send-traces [on|off|status]` / `company-cost send-openspec [on|off|status]` (`on` is the default).
+- Sidecar `features` object; `status` and `doctor` show each feature and what it sends.
+- Hook gating: with both features off every hook is a silent no-op; with traces only, no change fields are sent and no `openspec` command, sync or snapshot runs.
+- openspec-only mode sends exactly one session `start` event per session as project registration (the server rejects `sync/plan` with `409 unknown_project` otherwise); no heartbeat, end or prompt excerpt.
+
+### Changed
+- BREAKING-ISH: `setup` now only stores the connection (URL, token) and no longer writes `settings.json` or enables anything. It prints the next steps. Run `/company-cost:send-traces` to get the old `setup` behavior (same 9 keys, backup, `--force` rule, restore on `off`/uninstall).
+- Queued items that belong to a disabled feature are dropped instead of sent.
+- `send-traces off` keeps URL and token in the sidecar; `uninstall` still removes everything.
+
+### Migration from 0.1.0
+Existing installs keep working: a sidecar without `features` is treated as both features enabled. Use `send-traces off` / `send-openspec off` to narrow it.
+
 ## [0.1.0] - 2026-11-10
 
 Initial public release.
