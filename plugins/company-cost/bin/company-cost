@@ -2,7 +2,7 @@
 """company-cost: Claude Code plugin helper (stdlib only, Python 3.9+).
 
 Commands:
-  company-cost setup [--url U] [--token T] [--token-stdin] [--agent NAME] [--force] [--allow-insecure]
+  company-cost setup [--url U] [--token T] [--token-stdin] [--agent NAME] [--environment ENV] [--force] [--allow-insecure]
   company-cost send-traces [on|off|status] [--force]      (default: on)
   company-cost send-openspec [on|off|status]             (default: on)
   company-cost uninstall
@@ -79,9 +79,9 @@ MAX_DELETE = 500
 
 EXCERPT_SOURCE_CHARS = 8000
 EXCERPT_MAX = 200
-AGENT_NAME_MAX = 64
-USER_REF_MAX = 200
+LABEL_MAX = 64
 AGENT_ENV = "CLAUDE_PLUGIN_OPTION_AGENT_NAME"
+ENVIRONMENT_ENV = "CLAUDE_PLUGIN_OPTION_ENVIRONMENT"
 
 MANAGED_ENV_KEYS = (
     "CLAUDE_CODE_ENABLE_TELEMETRY",
@@ -417,31 +417,57 @@ def validate_token(token):
     return None
 
 
-def validate_agent_name(name):
-    """Return (clean_name, error). Exactly one is None."""
-    if not isinstance(name, str):
-        return None, "agent name must be text"
-    n = name.strip()
+def _validate_label(value, what):
+    """Shared rules for the agent name and the environment. Returns (clean, error)."""
+    if not isinstance(value, str):
+        return None, "%s must be text" % what
+    n = value.strip()
     if not n:
-        return None, "agent name is empty (use --agent \"\" to clear it)"
-    if len(n) > AGENT_NAME_MAX:
-        return None, "agent name is too long (max %d characters)" % AGENT_NAME_MAX
+        return None, "%s is empty (use \"\" to clear it)" % what
+    if len(n) > LABEL_MAX:
+        return None, "%s is too long (max %d characters)" % (what, LABEL_MAX)
     for ch in n:
-        cat = unicodedata.category(ch)
-        if cat[0] == "C":
-            return None, "agent name must not contain control or invisible characters"
-        if not (ch.isalnum() or ch in " ._-:/"):
-            return None, "agent name may only contain letters, digits, space and . _ - : /"
+        if unicodedata.category(ch)[0] == "C":
+            return None, "%s must not contain control or invisible characters" % what
+        if not (ch.isalnum() or ch in " ._-:"):
+            return None, "%s may only contain letters, digits, space and . _ - :" % what
     # Same redaction as prompts: anything it would alter looks like a secret (or is not NFKC-stable).
     if redact_excerpt(_WS_RE.sub(" ", n)) != _WS_RE.sub(" ", n) or unicodedata.normalize("NFKC", n) != n:
-        return None, "agent name looks like a secret or contains unsupported characters; use a plain label"
-    if len(agent_user_ref(n)) > USER_REF_MAX:
-        return None, "agent name is too long"
+        return None, "%s looks like a secret or contains unsupported characters; use a plain label" % what
     return n, None
 
 
-def agent_user_ref(name):
-    return "agent:" + name
+def validate_agent_name(name):
+    """Return (clean_name, error). Exactly one is None."""
+    return _validate_label(name, "agent name")
+
+
+def validate_environment(env):
+    """Return (clean_environment, error). Exactly one is None."""
+    return _validate_label(env, "environment")
+
+
+def agent_user_ref(name, environment=None):
+    """`agent:<environment>/<name>`, `agent:<name>`, `agent:<environment>/`, or None when both are unset."""
+    if environment:
+        return "agent:%s/%s" % (environment, name or "")
+    if name:
+        return "agent:" + name
+    return None
+
+
+def _resolve_label(side, key, env_var, validator):
+    stored = side.get(key) if isinstance(side, dict) else None
+    if isinstance(stored, str):
+        clean, err = validator(stored)
+        if clean and not err:
+            return clean
+    env = os.environ.get(env_var)
+    if isinstance(env, str) and env.strip():
+        clean, err = validator(env)
+        if clean and not err:
+            return clean
+    return None
 
 
 def resolve_agent_name(side):
@@ -449,17 +475,16 @@ def resolve_agent_name(side):
 
     Invalid stored/env values are ignored (hooks must stay silent).
     """
-    stored = side.get("agent_name") if isinstance(side, dict) else None
-    if isinstance(stored, str):
-        clean, err = validate_agent_name(stored)
-        if clean and not err:
-            return clean
-    env = os.environ.get(AGENT_ENV)
-    if isinstance(env, str) and env.strip():
-        clean, err = validate_agent_name(env)
-        if clean and not err:
-            return clean
-    return None
+    return _resolve_label(side, "agent_name", AGENT_ENV, validate_agent_name)
+
+
+def resolve_environment(side):
+    """Configured environment or None (sidecar first, then the ENVIRONMENT plugin option)."""
+    return _resolve_label(side, "environment", ENVIRONMENT_ENV, validate_environment)
+
+
+def resolve_user_ref(side):
+    return agent_user_ref(resolve_agent_name(side), resolve_environment(side))
 
 
 # ---------------------------------------------------------------------------
@@ -1271,10 +1296,10 @@ def flush_queue(cfg, budget=QUEUE_FLUSH_BUDGET, flags=None):
 # ---------------------------------------------------------------------------
 # Hooks
 # ---------------------------------------------------------------------------
-def _session_payload(event, sid, ident, cwd, change, source, agent=None):
+def _session_payload(event, sid, ident, cwd, change, source, agent=None, environment=None):
     """change/source None => the openspec feature is off: the change fields are omitted entirely.
 
-    agent (validated name or None) is sent as `user_ref` = `agent:<name>`; omitted when unset.
+    agent / environment (validated or None) form `user_ref` (see agent_user_ref); omitted when both are unset.
     """
     body = {
         "event": event,
@@ -1288,8 +1313,9 @@ def _session_payload(event, sid, ident, cwd, change, source, agent=None):
     if change is not None:
         body["change_name"] = change
         body["change_source"] = source
-    if agent:
-        body["user_ref"] = agent_user_ref(agent)
+    ref = agent_user_ref(agent, environment)
+    if ref:
+        body["user_ref"] = ref
     return body
 
 
@@ -1341,6 +1367,7 @@ def run_hook(event, data):
         return
     sid = sid[:200]
     agent = resolve_agent_name(side)
+    environment = resolve_environment(side)
     cwd = data.get("cwd") if isinstance(data.get("cwd"), str) and data.get("cwd") else os.getcwd()
     if event not in ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"):
         return
@@ -1365,7 +1392,7 @@ def run_hook(event, data):
                 if isinstance(inf, dict) and isinstance(inf.get("change"), str) \
                         and isinstance(inf.get("source"), str):
                     change, source = inf["change"], inf["source"]
-        send(cfg, "session", _session_payload("end", sid, ident, cwd, change, source, agent), TIMEOUT_SESSION_END)
+        send(cfg, "session", _session_payload("end", sid, ident, cwd, change, source, agent, environment), TIMEOUT_SESSION_END)
         return
     if event == "UserPromptSubmit" and not costs:
         return  # openspec-only sends nothing per prompt
@@ -1383,12 +1410,12 @@ def run_hook(event, data):
     if event == "SessionStart":
         # With openspec-only this single `start` is the project registration the server needs
         # before it accepts sync/plan (409 unknown_project otherwise).
-        send(cfg, "session", _session_payload("start", sid, ident, cwd, change, source, agent), TIMEOUT_SESSION_START)
+        send(cfg, "session", _session_payload("start", sid, ident, cwd, change, source, agent, environment), TIMEOUT_SESSION_START)
         flush_queue(cfg, flags=flags)
         if spec:
             maybe_spawn_sync(ident, cwd, force=True)
     elif event == "UserPromptSubmit":
-        send(cfg, "session", _session_payload("heartbeat", sid, ident, cwd, change, source, agent), TIMEOUT_HEARTBEAT)
+        send(cfg, "session", _session_payload("heartbeat", sid, ident, cwd, change, source, agent, environment), TIMEOUT_HEARTBEAT)
         excerpt = ""
         if os.environ.get("COMPANY_COST_NO_PROMPTS") != "1" and prompt:
             excerpt = redact_excerpt(prompt)
@@ -1402,7 +1429,7 @@ def run_hook(event, data):
     elif event == "Stop":
         outcome = None
         if costs:
-            outcome = send(cfg, "session", _session_payload("heartbeat", sid, ident, cwd, change, source, agent),
+            outcome = send(cfg, "session", _session_payload("heartbeat", sid, ident, cwd, change, source, agent, environment),
                            TIMEOUT_HEARTBEAT)
         if spec:
             maybe_spawn_sync(ident, cwd, force=False)
@@ -1635,8 +1662,8 @@ def enable_costs(side, force, err):
 
 
 @with_sidecar_lock
-def do_setup(url, token, force, allow_insecure, out, err, agent=None):
-    """agent: None keeps the stored name, "" clears it, otherwise a validated name replaces it."""
+def do_setup(url, token, force, allow_insecure, out, err, agent=None, environment=None):
+    """agent / environment: None keeps the stored value, "" clears it, otherwise a validated value replaces it."""
     os.makedirs(config_dir(), exist_ok=True)
     side = read_sidecar()
     feats = setup_features(side)
@@ -1645,6 +1672,9 @@ def do_setup(url, token, force, allow_insecure, out, err, agent=None):
     keep = side.get("agent_name") if agent is None else agent
     if isinstance(keep, str) and keep:
         new["agent_name"] = keep
+    keep_env = side.get("environment") if environment is None else environment
+    if isinstance(keep_env, str) and keep_env:
+        new["environment"] = keep_env
     if feats["costs"]:
         # costs already on: keep settings.json in sync with the (possibly new) URL/token
         rc = enable_costs(new, force, err)
@@ -1657,6 +1687,8 @@ def do_setup(url, token, force, allow_insecure, out, err, agent=None):
     out.write("  URL:   %s\n  token: set (hidden)\n" % url)
     if agent is not None:
         out.write("  agent: %s\n" % (new.get("agent_name") or "not set"))
+    if environment is not None:
+        out.write("  environment: %s\n" % (new.get("environment") or "not set"))
     if feats["costs"]:
         out.write("  Refreshed the managed keys in %s (traces is on). Restart Claude Code.\n" % settings_path())
     if not any(feats.values()):
@@ -1893,10 +1925,11 @@ def _fmt_ts(t):
 
 def _write_agent(side, out):
     agent = resolve_agent_name(side)
-    if agent:
-        out.write("Agent name: %s (sent as user_ref `%s`)\n" % (agent, agent_user_ref(agent)))
-    else:
-        out.write("Agent name: not set (user_ref is not sent)\n")
+    env = resolve_environment(side)
+    ref = agent_user_ref(agent, env)
+    out.write("Agent name: %s\n" % (agent or "not set"))
+    out.write("Environment: %s\n" % (env or "not set"))
+    out.write("user_ref sent: %s\n" % (("`%s`" % ref) if ref else "none (omitted)"))
 
 
 def do_status(out):
@@ -1982,6 +2015,7 @@ def cmd_setup(argv, out=None, err=None):
     ap.add_argument("--token")
     ap.add_argument("--token-stdin", action="store_true")
     ap.add_argument("--agent", default=None)
+    ap.add_argument("--environment", default=None)
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--allow-insecure", action="store_true")
     args = ap.parse_args(argv)
@@ -2017,16 +2051,17 @@ def cmd_setup(argv, out=None, err=None):
     if problem:
         err.write("error: %s\n" % problem)
         return 1
-    agent = None
-    if args.agent is not None:
-        if args.agent == "":
-            agent = ""
-        else:
-            agent, problem = validate_agent_name(args.agent)
+    labels = {}
+    for attr, validator in (("agent", validate_agent_name), ("environment", validate_environment)):
+        raw = getattr(args, attr)
+        labels[attr] = raw
+        if raw:
+            labels[attr], problem = validator(raw)
             if problem:
                 err.write("error: %s\n" % problem)
                 return 1
-    return do_setup(clean, token, args.force, args.allow_insecure, out, err, agent)
+    return do_setup(clean, token, args.force, args.allow_insecure, out, err,
+                    labels["agent"], labels["environment"])
 
 
 def main(argv=None):

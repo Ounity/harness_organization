@@ -28,7 +28,7 @@ class TestValidation(unittest.TestCase):
         self.assertTrue(err and isinstance(err, str), repr(raw))
 
     def test_valid(self):
-        for name in ("planner", "Code Reviewer 2", "a", "team/agent-1", "svc.v2_beta:x", "9", "Agénte ñandú"):
+        for name in ("planner", "Code Reviewer 2", "a", "svc.v2_beta:x", "9", "Agénte ñandú"):
             self.ok(name)
         self.ok("  padded  ", "padded")
         longest = ("agent " * 11)[:64]
@@ -48,7 +48,7 @@ class TestValidation(unittest.TestCase):
             self.bad(raw)
 
     def test_disallowed_chars(self):
-        for raw in ("a;b", "a'b", 'a"b', "a$(x)", "a`b`", "a|b", "a&b", "a\\b", "a<b", "a=b", "a@b", "a#b",
+        for raw in ("a;b", "team/agent", "/", "a/", "a'b", 'a"b', "a$(x)", "a`b`", "a|b", "a&b", "a\\b", "a<b", "a=b", "a@b", "a#b",
                     "a*b", "emoji \U0001F600"):
             self.bad(raw)
 
