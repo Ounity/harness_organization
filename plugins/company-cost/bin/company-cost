@@ -453,11 +453,18 @@ REGISTRATION_NOTE = ("openspec-only registration exception: the server rejects s
 
 
 def feature_flags(side):
-    """Return {'costs': bool, 'openspec': bool}. A sidecar without `features` (0.1.0) means both on."""
-    f = side.get("features") if isinstance(side, dict) else None
-    if isinstance(f, dict):
-        return dict((k, f.get(k) is True) for k in FEATURES)
-    return dict((k, True) for k in FEATURES)
+    """Return {'costs': bool, 'openspec': bool}.
+
+    Legacy 0.1.0 installs (a parseable sidecar with `url` and no `features` key) mean both on. A missing,
+    unparseable, empty or malformed sidecar means both off: nothing is sent without an explicit opt-in.
+    """
+    if isinstance(side, dict):
+        f = side.get("features")
+        if isinstance(f, dict):
+            return dict((k, f.get(k) is True) for k in FEATURES)
+        if "features" not in side and isinstance(side.get("url"), str) and side["url"]:
+            return dict((k, True) for k in FEATURES)
+    return dict((k, False) for k in FEATURES)
 
 
 def setup_features(side):

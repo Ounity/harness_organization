@@ -1,4 +1,5 @@
 """Regression tests for the second code-review round (F1-F10)."""
+import json
 import os
 import re
 import threading
@@ -163,6 +164,8 @@ class TestF6SyncDeletes(EnvCase):
     def setUp(self):
         super().setUp()
         os.makedirs(self.data, exist_ok=True)
+        with open(cc.sidecar_path(), "w") as f:
+            json.dump({"features": {"costs": True, "openspec": True}}, f)
         self.root = os.path.join(self.tmp, "repo", "openspec")
         os.makedirs(os.path.join(self.root, "specs"))
         self.write("specs/ok.md", "ok")
@@ -210,6 +213,8 @@ class TestF7SyncFailure(EnvCase):
     def setUp(self):
         super().setUp()
         os.makedirs(self.data, exist_ok=True)
+        with open(cc.sidecar_path(), "w") as f:
+            json.dump({"features": {"costs": True, "openspec": True}}, f)
         self.root = os.path.join(self.tmp, "repo", "openspec")
         os.makedirs(os.path.join(self.root, "specs"))
         with open(os.path.join(self.root, "specs", "a.md"), "w") as f:

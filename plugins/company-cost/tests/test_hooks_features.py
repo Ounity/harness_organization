@@ -145,8 +145,26 @@ class TestGatingMatrix(GateCase):
         self.assertIn("prompt", self.server.paths())
         self.assertIn("sync/plan", self.server.paths())
 
-    def test_sidecar_without_file_runs_everything(self):
-        # env-configured installs (userConfig) have no sidecar at all: both features on
+    def test_env_only_config_without_sidecar_sends_nothing(self):
+        # plugin-option-only users have no sidecar: no opt-in, so no feature is on
+        os.unlink(os.path.join(self.cfg, "settings.company-cost.json"))
+        self.populate()
+        self.recording_shim()
+        self.run_session()
+        self.settle()
+        self.assertEqual(self.server.requests, [])
+        self.assertEqual(self.openspec_calls(), 0)
+
+    def test_corrupt_sidecar_sends_nothing(self):
+        with open(os.path.join(self.cfg, "settings.company-cost.json"), "w") as f:
+            f.write("{not json")
+        self.run_session()
+        self.settle()
+        self.assertEqual(self.server.requests, [])
+
+    def test_legacy_0_1_0_sidecar_runs_everything(self):
+        with open(os.path.join(self.cfg, "settings.company-cost.json"), "w") as f:
+            json.dump({"url": self.server.url, "token": self.token, "version": "0.1.0"}, f)
         self.run_session()
         self.settle()
         self.assertIn("prompt", self.server.paths())

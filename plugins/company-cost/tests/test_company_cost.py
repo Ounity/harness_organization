@@ -1208,6 +1208,8 @@ class TestReviewFixes(EnvCase):
     def test_session_end_sends_first_without_openspec(self):
         ident = {"key": "k", "name": "n", "repo_display": "n", "branch": "b", "toplevel": ""}
         cc.session_meta_update("sid", ident=ident, infer={"change": "c", "source": "recent", "branch": "b", "ts": 1})
+        with open(cc.sidecar_path(), "w") as f:
+            json.dump({"features": {"costs": True, "openspec": True}}, f)
         sent = []
         with mock.patch.object(cc, "openspec_list", side_effect=AssertionError("no openspec")), \
                 mock.patch.object(cc, "project_identity", side_effect=AssertionError("no git")), \

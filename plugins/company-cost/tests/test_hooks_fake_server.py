@@ -99,6 +99,9 @@ class HookCase(unittest.TestCase):
         for d in (self.cfg, self.home, self.shim):
             os.makedirs(d)
         self.token = make_token()
+        # env-only config sends nothing (opt-in required): default these tests to both features on
+        with open(os.path.join(self.cfg, "settings.company-cost.json"), "w") as f:
+            json.dump({"features": {"costs": True, "openspec": True}, "version": "0.2.0"}, f)
         self.servers = []
         self.server = self.new_server()
         self.addCleanup(self.cleanup)

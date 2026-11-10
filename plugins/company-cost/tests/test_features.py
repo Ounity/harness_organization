@@ -26,12 +26,17 @@ class FeatureCase(EnvCase):
 
 class TestFeatureFlags(FeatureCase):
     def test_flags_helper(self):
-        self.assertEqual(cc.feature_flags({}), {"costs": True, "openspec": True})  # legacy
+        off = {"costs": False, "openspec": False}
+        self.assertEqual(cc.feature_flags({}), off)  # empty / missing / corrupt sidecar: opt-in required
+        self.assertEqual(cc.feature_flags({"url": URL}), {"costs": True, "openspec": True})  # 0.1.0 legacy
+        self.assertEqual(cc.feature_flags({"url": URL, "features": "junk"}), off)
+        self.assertEqual(cc.feature_flags({"token": "t"}), off)
         self.assertEqual(cc.feature_flags({"features": {"costs": True, "openspec": False}}),
                          {"costs": True, "openspec": False})
         self.assertEqual(cc.feature_flags({"features": {}}), {"costs": False, "openspec": False})
         self.assertEqual(cc.feature_flags({"features": {"costs": "yes"}}), {"costs": False, "openspec": False})
-        self.assertEqual(cc.feature_flags({"features": "junk"}), {"costs": True, "openspec": True})
+        self.assertEqual(cc.feature_flags({"features": "junk"}), off)
+        self.assertEqual(cc.feature_flags(None), off)
 
     def test_legacy_sidecar_means_both_enabled(self):
         self.write_side({"url": URL, "token": "t", "version": "0.1.0", "managed_keys": sorted(cc.MANAGED_ENV_KEYS)})
