@@ -27,7 +27,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 # Constants (single block)
 # ---------------------------------------------------------------------------
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 PLUGIN_NAME = "company-cost"
 API_PREFIX = "/v1/ingest/plugin/"
 SERVER_CONTRACT = "/v1/ingest/plugin/* (v1)"

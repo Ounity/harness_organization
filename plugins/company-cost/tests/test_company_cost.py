@@ -107,7 +107,7 @@ def git(cwd, *args):
 # ---------------------------------------------------------------------------
 class TestIdentityAndVersion(unittest.TestCase):
     def test_version_constant(self):
-        self.assertEqual(cc.VERSION, "0.1.0")
+        self.assertEqual(cc.VERSION, "0.2.0")
 
     def test_version_consistency_with_plugin_json(self):
         pj = os.path.join(PLUGIN_ROOT, ".claude-plugin", "plugin.json")

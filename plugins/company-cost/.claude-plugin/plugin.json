@@ -1,7 +1,7 @@
 {
   "name": "company-cost",
   "displayName": "Company Cost",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Reports Claude Code cost telemetry and OpenSpec progress to an ingest service you configure.",
   "author": {
     "name": "Ounity",

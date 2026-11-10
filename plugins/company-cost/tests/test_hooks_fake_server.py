@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN_ROOT = os.path.dirname(HERE)
 SCRIPT = os.path.join(PLUGIN_ROOT, "bin", "company-cost")
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SESSION_KEYS = {"event", "session_id", "project_key", "project_name", "branch", "repo_display",
                 "change_name", "change_source", "cwd_hash"}
 
