@@ -1,0 +1,30 @@
+{
+  "name": "company-cost",
+  "displayName": "Company Cost",
+  "version": "0.1.0",
+  "description": "Reports Claude Code cost telemetry and OpenSpec progress to an ingest service you configure.",
+  "author": {
+    "name": "Ounity",
+    "url": "https://github.com/Ounity"
+  },
+  "homepage": "https://github.com/Ounity/harness_organization",
+  "repository": "https://github.com/Ounity/harness_organization",
+  "license": "Apache-2.0",
+  "keywords": ["cost", "telemetry", "openspec", "otel"],
+  "icon": "./assets/icon.png",
+  "userConfig": {
+    "RAG_URL": {
+      "type": "string",
+      "title": "Ingest service URL",
+      "description": "Base URL of your ingest service, for example https://ingest.example.com",
+      "required": false
+    },
+    "RAG_TOKEN": {
+      "type": "string",
+      "title": "Ingest service token",
+      "description": "Bearer token issued by your ingest service (starts with hro_)",
+      "sensitive": true,
+      "required": false
+    }
+  }
+}
